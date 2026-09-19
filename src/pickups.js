@@ -16,6 +16,8 @@
   var Pool = global.GG.Pool;
 
   var KINDS = {
+    broadside: { sprite: 'pu_broadside', color: '#49d8ff', label: 'SIDE BARRAGE' },
+    nova:    { sprite: 'pu_nova', color: '#ff673c', label: 'NOVA BOMB' },
     weapon:  { sprite: 'pu_weapon',  color: '#5dff7a', label: 'WEAPON UPGRADE' },
     missile: { sprite: 'pu_missile', color: '#ff9a2a', label: null },
     shield:  { sprite: 'pu_shield',  color: '#49d8ff', label: 'SHIELD UP' },

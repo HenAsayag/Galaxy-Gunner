@@ -753,6 +753,30 @@
       ctx.stroke();
     });
 
+    coin('pu_broadside', '#49d8ff', function (ctx, s) {
+      ctx.strokeStyle = '#052139';
+      ctx.lineWidth = s * 0.10;
+      for (var side = -1; side <= 1; side += 2) {
+        ctx.beginPath();
+        ctx.moveTo(side * s * 0.36, -s * 0.23);
+        ctx.lineTo(side * s * 0.12, 0);
+        ctx.lineTo(side * s * 0.36, s * 0.23);
+        ctx.stroke();
+      }
+    });
+    coin('pu_nova', '#ff673c', function (ctx, s) {
+      ctx.strokeStyle = '#391005';
+      ctx.lineWidth = s * 0.08;
+      ctx.beginPath();
+      ctx.arc(0, 0, s * 0.16, 0, Math.PI * 2);
+      for (var ray = 0; ray < 8; ray++) {
+        var a = ray * Math.PI / 4;
+        ctx.moveTo(Math.cos(a) * s * 0.23, Math.sin(a) * s * 0.23);
+        ctx.lineTo(Math.cos(a) * s * 0.37, Math.sin(a) * s * 0.37);
+      }
+      ctx.stroke();
+    });
+
     /* ---- UI ---------------------------------------------------------------- */
 
     sprite('ui_pause', 26, 26, function (ctx, w, h) {

@@ -28,7 +28,8 @@
     "magnetRadius": 78,
     "weights": {
       "weapon": 26, "missile": 14, "shield": 14,
-      "rapid": 12, "multi": 10, "magnet": 8, "bomb": 8
+      "rapid": 12, "multi": 10, "magnet": 8, "bomb": 8,
+      "broadside": 7, "nova": 3
     }
   },
 

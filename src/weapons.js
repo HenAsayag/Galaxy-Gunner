@@ -117,6 +117,20 @@
     this.droneAngle += dt / 1000 * 3.4;
   };
 
+  /* A single crossfire from both screen edges, never a permanent upgrade. */
+  Weapons.prototype.fireBroadside = function (world, player) {
+    for (var side = -1; side <= 1; side += 2) {
+      var x = side < 0 ? 8 : world.worldW - 8;
+      for (var i = 0; i < 7; i++) {
+        var y = Math.max(20, Math.min(world.worldH - 20, player.y - 30 - i * 28));
+        world.spawnPlayerBullet(x, y, -side * 520, -180,
+          'bolt_s', 4, { color: '#49d8ff', pierce: 2 });
+        world.fx.muzzle(x, y, 1.2, '#49d8ff');
+      }
+    }
+    world.audio.play('shot_big');
+  };
+
   Weapons.prototype.fireMain = function (world, player, spec) {
     var damage = spec.damage * (1 + (this.tier - 1) * 0.05);
     for (var i = 0; i < spec.ports.length; i++) {

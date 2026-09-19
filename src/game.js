@@ -581,9 +581,10 @@
     this.fx.explosion(this.player.x, this.player.y, 1.6, 'heavy');
     this.audio.play('player_hit');
 
-    /* Losing a life costs a weapon tier, which is the pressure that makes the
-     * upgrade pickups matter. */
-    if (this.weapons.tier > 1) this.weapons.tier--;
+    /* Every lost life starts the arsenal over, including modules and rapid fire. */
+    this.weapons.reset();
+    this.playerBullets.clear();
+    this.fx.banner('WEAPONS RESET', this.config.palette.playerBolt, 1000);
 
     if (result === 'dead') {
       this.endRun();
@@ -595,6 +596,14 @@
   World.prototype.useBomb = function () {
     if (!this.player.active() || this.player.bombs <= 0) return false;
     this.player.bombs--;
+
+    this.detonateBomb();
+    this.onEvent('bomb', { bombs: this.player.bombs });
+    return true;
+  };
+
+  /* Also used by the instant nova pickup, without spending a stored bomb. */
+  World.prototype.detonateBomb = function () {
 
     this.enemyBullets.clear();
     this.fx.flash('#ffffff', 0.85);
@@ -609,8 +618,6 @@
       if (this.enemies.hit(e, 14)) this.killEnemy(e, i);
     }
     if (this.boss.active()) this.damageBoss(60);
-    this.onEvent('bomb', { bombs: this.player.bombs });
-    return true;
   };
 
   /* ---- pickups --------------------------------------------------------------- */
@@ -653,6 +660,14 @@
       case 'bomb':
         this.player.addBomb();
         label = 'BOMB +1';
+        break;
+      case 'broadside':
+        this.weapons.fireBroadside(this, this.player);
+        label = 'SIDE BARRAGE';
+        break;
+      case 'nova':
+        this.detonateBomb();
+        label = 'NOVA BOMB';
         break;
     }
 

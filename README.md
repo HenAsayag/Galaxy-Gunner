@@ -30,13 +30,18 @@ working").
 
 ## How to play
 
-- **Touch** — drag anywhere in the lower three quarters of the screen. The ship
+- **Touch** — drag anywhere on the playfield, all the way to its edges. The ship
   rides above your finger so it stays visible. Guns fire by themselves.
 - **Desktop** — move the mouse, or steer with `WASD` / arrow keys.
 - `Space` fires a bomb. `Esc` or `P` pauses.
 - Your hitbox is the cockpit, not the wingspan — much smaller than the ship
   looks. Weave through bullet lanes rather than going around them.
-- A hit costs a life **and a weapon tier**, so pickups are worth chasing.
+- Losing a life resets the main gun to tier 1, removes secondary modules and
+  rapid fire, and clears existing player shots. Shielded hits preserve weapons.
+- **Side Barrage** fires one volley from both screen edges when collected.
+- **Nova Bomb** detonates immediately on collection, clearing enemy bullets and
+  damaging enemies and bosses without spending a stored bomb. These rare pickups
+  are one-shot effects, not permanent upgrades.
 - A red glow around an enemy means a dense attack is 220 ms away.
 
 ## Layout

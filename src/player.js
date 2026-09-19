@@ -41,10 +41,10 @@
   Player.prototype.bounds = function (worldW, worldH) {
     var p = this.config.player;
     return {
-      minX: p.marginX,
-      maxX: worldW - p.marginX,
-      minY: worldH * p.topFraction,
-      maxY: worldH - p.bottomMargin
+      minX: p.hitRadius,
+      maxX: worldW - p.hitRadius,
+      minY: p.hitRadius,
+      maxY: worldH - p.hitRadius
     };
   };
 
@@ -88,7 +88,10 @@
     } else {
       if (input) {
         this.targetX = M.clamp(input.x, b.minX, b.maxX);
-        this.targetY = M.clamp(input.y - (input.offsetY || 0), b.minY, b.maxY);
+        /* Fade the finger offset near the bottom so touch can reach that edge. */
+        var offset = input.offsetY || 0;
+        var edgeFade = M.clamp((b.maxY - input.y) / Math.max(1, offset * 2), 0, 1);
+        this.targetY = M.clamp(input.y - offset * edgeFade, b.minY, b.maxY);
       }
       /* Cap the per-frame step so a teleporting pointer (a second finger, a
        * resume after a long pause) cannot slingshot the ship through bullets. */

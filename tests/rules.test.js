@@ -419,13 +419,19 @@ test('the ship stays inside its bounds under any input', () => {
   }
 });
 
-test('vertical freedom matches the brief', () => {
+test('touch can reach all four playfield edges', () => {
   const config = freshConfig();
   const player = new GG.Player(config);
   const b = player.bounds(450, 850);
-  const freedom = (b.maxY - b.minY) / 850;
-  assert.ok(freedom > 0.5 && freedom < 0.62,
-    `the ship should roam roughly the lower 55-60%, got ${(freedom * 100).toFixed(1)}%`);
+  assert.strictEqual(b.minY, config.player.hitRadius);
+  assert.strictEqual(b.maxY, 850 - config.player.hitRadius);
+  for (const target of [{ x: 0, y: 0 }, { x: 450, y: 850 }]) {
+    for (let i = 0; i < 300; i++) {
+      player.update(16.667, { ...target, offsetY: 46 }, 450, 850);
+    }
+    assert.ok(Math.abs(player.x - (target.x ? b.maxX : b.minX)) < 0.01);
+    assert.ok(Math.abs(player.y - (target.y ? b.maxY : b.minY)) < 0.01);
+  }
 });
 
 test('a hit is ignored while already invulnerable', () => {
@@ -534,6 +540,76 @@ test('a group never exceeds the on-screen enemy budget', () => {
  * air, pool ceilings and numerical stability over a long run. */
 
 section('full run');
+
+function armedWorld() {
+  const config = freshConfig();
+  const world = new GG.World(config, {
+    fx: new GG.Effects(config), audio: { play() {} }
+  });
+  world.state = 'playing';
+  world.weapons.tier = 6;
+  world.weapons.moduleLevel = 3;
+  world.weapons.moduleIndex = 4;
+  world.weapons.rapidMs = 5000;
+  return world;
+}
+
+test('losing a life resets all weapons, including on the final life', () => {
+  for (const lives of [1, 3]) {
+    const world = armedWorld();
+    world.player.lives = lives;
+    world.hurtPlayer();
+    assert.strictEqual(world.player.lives, lives - 1);
+    assert.strictEqual(world.weapons.tier, 1);
+    assert.strictEqual(world.weapons.moduleLevel, 0);
+    assert.strictEqual(world.weapons.moduleIndex, 0);
+    assert.strictEqual(world.weapons.rapidMs, 0);
+    assert.strictEqual(world.weapons.dwell, null);
+  }
+});
+
+test('shield and invulnerability preserve the arsenal', () => {
+  for (const protection of ['shield', 'invulnMs']) {
+    const world = armedWorld();
+    world.player[protection] = 1;
+    world.hurtPlayer();
+    assert.strictEqual(world.player.lives, 3);
+    assert.strictEqual(world.weapons.tier, 6);
+    assert.strictEqual(world.weapons.moduleLevel, 3);
+    assert.strictEqual(world.weapons.rapidMs, 5000);
+  }
+});
+
+test('side barrage fires once from both edges without upgrading weapons', () => {
+  const world = armedWorld();
+  const p = world.pickups.spawn(100, 100, 'broadside');
+  assert.ok(p && p.sprite === 'pu_broadside');
+  world.collect(p);
+  assert.strictEqual(world.playerBullets.live, 14);
+  let left = 0, right = 0;
+  for (let i = 0; i < world.playerBullets.live; i++) {
+    const b = world.playerBullets.at(i);
+    if (b.vx > 0) left++; else right++;
+  }
+  assert.strictEqual(left, 7);
+  assert.strictEqual(right, 7);
+  assert.strictEqual(world.weapons.tier, 6);
+  assert.strictEqual(world.weapons.moduleLevel, 3);
+});
+
+test('nova clears bullets and damages a boss without spending stored bombs', () => {
+  const world = armedWorld();
+  world.enemyBullets.obtain();
+  let damage = 0;
+  world.boss.active = () => true;
+  world.damageBoss = amount => { damage += amount; };
+  const p = world.pickups.spawn(100, 100, 'nova');
+  assert.ok(p && p.sprite === 'pu_nova');
+  world.collect(p);
+  assert.strictEqual(world.enemyBullets.live, 0);
+  assert.strictEqual(world.player.bombs, world.config.player.startBombs);
+  assert.strictEqual(damage, 60);
+});
 
 /* Drives `seconds` of simulated play at a fixed 60 Hz.
  * `sloppy` adds a reaction delay and aim error, approximating a person. */

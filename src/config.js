@@ -168,7 +168,7 @@
        * they notice is that upgrades keep arriving. */
       pityKills: 16,
       /* relative weights used when an enemy drops something */
-      weights: { weapon: 26, missile: 14, shield: 14, rapid: 12, multi: 10, magnet: 8, bomb: 8 }
+      weights: { weapon: 26, missile: 14, shield: 14, rapid: 12, multi: 10, magnet: 8, bomb: 8, broadside: 7, nova: 3 }
     },
 
     /* ---- stage pacing ---------------------------------------------------- */

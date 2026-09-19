@@ -5,7 +5,7 @@
  * is the usual source of a phone registering one gesture twice.
  *
  * Rules the brief is specific about, and how they are met here:
- *   - drag anywhere in the lower 75% of the screen moves the ship      -> DRAG_ZONE
+ *   - drag anywhere on the playfield moves the ship                    -> DRAG_ZONE
  *   - the ship sits above the finger so it stays visible               -> config.player.fingerOffsetY
  *   - multi-touch must not interrupt movement                          -> activeId, extra fingers ignored
  *   - touchcancel must be handled                                      -> pointercancel releases cleanly
@@ -21,7 +21,7 @@
   var M = global.GG.math;
   var Layout = global.GG.layout;
 
-  var DRAG_ZONE = 0.25;           /* top fraction of the screen that is inert */
+  var DRAG_ZONE = 0;              /* the whole playfield accepts steering */
   var KEY_SPEED = 620;            /* world units / sec for keyboard steering */
 
   var MOVE_KEYS = {
@@ -76,8 +76,7 @@
       var layout = self.handlers.getLayout();
       if (!layout) return;
       var p = self.toWorld(event, layout);
-      /* Only the lower part of the screen starts a drag; the HUD strip is for
-       * reading, not steering. */
+      /* Buttons are excluded above; the remaining playfield accepts drags. */
       if (p.y < layout.worldH * DRAG_ZONE) return;
 
       /* A second finger never steals control from the one already steering. */
