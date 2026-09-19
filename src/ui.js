@@ -1,5 +1,14 @@
-/* Screens, settings, persistence and the practice coach.
- * Everything here is DOM: the canvas layer knows nothing about it. */
+/* Screens, settings and persistence.
+ *
+ * Everything here is DOM: the canvas layer knows nothing about it. The
+ * Storage wrapper, the screen router and the throttled live region are
+ * carried over unchanged from the previous build - they were working, they are
+ * not gameplay-specific, and the private-mode fallback in particular is worth
+ * keeping.
+ *
+ * What changed: the option list, the game-over panel and the coach, which all
+ * described a ring game.
+ */
 (function (global) {
   'use strict';
 
@@ -12,7 +21,7 @@
     this.memory = {};
     this.available = false;
     try {
-      var probe = '__cp__';
+      var probe = '__gg__';
       global.localStorage.setItem(probe, '1');
       global.localStorage.removeItem(probe);
       this.available = true;
@@ -45,36 +54,32 @@
     this.config = config;
     this.storage = new Storage(config.storageKey);
     this.el = {};
-    this.currentScreen = null;   /* set to the loading screen below, so the
-                                  * first showScreen() fades it back out */
+    this.currentScreen = null;
     this.hideTimer = null;
     this.liveTimer = null;
-    this.practice = null;
 
     var ids = [
       'app', 'playfield', 'hud-controls', 'btn-pause', 'btn-mute', 'mute-icon',
-      'btn-fullscreen', 'fullscreen-icon',
-      'tap-button', 'countdown-overlay', 'countdown-value',
-      'practice-banner', 'practice-text', 'practice-exit',
-      'screen-loading', 'screen-menu', 'screen-howto', 'screen-paused', 'screen-gameover',
-      'menu-best', 'btn-play', 'btn-howto', 'btn-practice',
-      'opt-sound', 'opt-reduced-motion', 'opt-reduced-flash', 'opt-decorative-timer',
-      'btn-howto-back', 'btn-howto-practice', 'howto-timer',
+      'btn-fullscreen', 'fullscreen-icon', 'btn-bomb',
+      'screen-loading', 'loading-text', 'screen-menu', 'screen-howto',
+      'screen-paused', 'screen-gameover', 'screen-fullscreen',
+      'gate-title', 'gate-text', 'gate-note',
+      'btn-gate-enter', 'btn-gate-skip', 'btn-gate-back',
+      'menu-best', 'btn-play', 'btn-howto', 'btn-howto-back',
+      'opt-sound', 'opt-music', 'opt-reduced-motion', 'opt-reduced-flash', 'opt-quality',
       'btn-resume', 'btn-restart-paused', 'btn-mute-paused', 'btn-menu-paused',
       'final-score', 'gameover-best', 'new-best', 'btn-restart', 'btn-menu',
-      'stat-hits', 'stat-misses', 'stat-timeouts', 'stat-hearts',
+      'stat-stage', 'stat-kills', 'stat-combo', 'stat-tier', 'stat-time',
       'live-region'
     ];
     var self = this;
-    ids.forEach(function (id) {
-      self.el[id] = document.getElementById(id);
-    });
+    ids.forEach(function (id) { self.el[id] = document.getElementById(id); });
 
     this.currentScreen = this.el['screen-loading'];
     this.settings = this.loadSettings();
   }
 
-  /* ---- settings --------------------------------------------------------- */
+  /* ---- settings ----------------------------------------------------------- */
 
   UI.prototype.loadSettings = function () {
     var saved = this.storage.read();
@@ -85,49 +90,57 @@
 
     return {
       sound: saved.sound !== undefined ? !!saved.sound : true,
+      music: saved.music !== undefined ? !!saved.music : true,
       /* Honour the OS preference unless the player has chosen for themselves. */
       reducedMotion: saved.reducedMotion !== undefined ? !!saved.reducedMotion : prefersReduced,
       reducedFlash: saved.reducedFlash !== undefined ? !!saved.reducedFlash : prefersReduced,
-      decorativeTimer: !!saved.decorativeTimer,
-      best: Number(saved.best) || 0
+      quality: saved.quality || 'auto',
+      best: Number(saved.best) || 0,
+      bestStage: Number(saved.bestStage) || 0
     };
   };
 
   UI.prototype.saveSettings = function () {
     this.storage.write({
       sound: this.settings.sound,
+      music: this.settings.music,
       reducedMotion: this.settings.reducedMotion,
       reducedFlash: this.settings.reducedFlash,
-      decorativeTimer: this.settings.decorativeTimer,
-      best: this.settings.best
+      quality: this.settings.quality,
+      best: this.settings.best,
+      bestStage: this.settings.bestStage
     });
   };
 
   UI.prototype.syncSettingInputs = function () {
     this.el['opt-sound'].checked = this.settings.sound;
+    this.el['opt-music'].checked = this.settings.music;
     this.el['opt-reduced-motion'].checked = this.settings.reducedMotion;
     this.el['opt-reduced-flash'].checked = this.settings.reducedFlash;
-    this.el['opt-decorative-timer'].checked = this.settings.decorativeTimer;
-    this.el['howto-timer'].textContent = String(this.config.rules.timerSeconds);
+    this.el['opt-quality'].value = this.settings.quality;
     this.updateBest();
   };
 
   UI.prototype.updateBest = function () {
-    this.el['menu-best'].textContent = String(this.settings.best);
-    this.el['gameover-best'].textContent = String(this.settings.best);
+    var text = this.settings.best.toLocaleString
+      ? this.settings.best.toLocaleString('en-US')
+      : String(this.settings.best);
+    this.el['menu-best'].textContent = text;
+    this.el['gameover-best'].textContent = text;
   };
 
-  UI.prototype.recordBest = function (score) {
-    if (score > this.settings.best) {
-      this.settings.best = score;
+  UI.prototype.recordBest = function (score, stage) {
+    var isBest = score > this.settings.best;
+    if (isBest) this.settings.best = score;
+    if (stage > this.settings.bestStage) this.settings.bestStage = stage;
+    if (isBest || stage > this.settings.bestStage) {
       this.saveSettings();
       this.updateBest();
-      return true;
     }
-    return false;
+    return isBest;
   };
 
-  /* ---- screens ---------------------------------------------------------- */
+  /* ---- screens ------------------------------------------------------------- */
 
   UI.prototype.showScreen = function (name) {
     var target = name ? this.el['screen-' + name] : null;
@@ -144,10 +157,9 @@
 
     if (target) {
       target.hidden = false;
-      /* Force layout so the opacity transition actually runs. */
-      void target.offsetWidth;
+      void target.offsetWidth;          /* force layout so the fade runs */
       target.classList.add('is-visible');
-      var focusable = target.querySelector('button, input');
+      var focusable = target.querySelector('button, select, input');
       if (focusable && previous) {
         try { focusable.focus({ preventScroll: true }); } catch (e) { focusable.focus(); }
       }
@@ -155,65 +167,129 @@
     this.currentScreen = target;
   };
 
-  /* Pause, mute and TAP belong to a live run. The full-screen button does not:
-   * it stays reachable from the menus too, so a phone can be set up before
-   * play starts. */
+  /* Pause, mute and the bomb button belong to a live run. The full-screen
+   * button does not: it stays reachable from the menus so a phone can be set
+   * up before play starts. */
   UI.prototype.setGameplayChromeVisible = function (visible) {
     this.el['btn-pause'].hidden = !visible;
     this.el['btn-mute'].hidden = !visible;
-    this.el['tap-button'].hidden = !visible;
+    this.el['btn-bomb'].hidden = !visible;
     var fullscreenShown = !this.el['btn-fullscreen'].hidden;
     this.el['hud-controls'].style.display = (visible || fullscreenShown) ? 'flex' : 'none';
+  };
+
+  UI.prototype.setBombCount = function (count) {
+    var button = this.el['btn-bomb'];
+    button.disabled = count <= 0;
+    button.setAttribute('aria-label', 'Use bomb, ' + count + ' remaining');
+    button.dataset.count = String(count);
   };
 
   UI.prototype.syncFullscreenButton = function (supported, active) {
     var button = this.el['btn-fullscreen'];
     button.hidden = !supported;
-    this.el['fullscreen-icon'].src = active
-      ? 'assets/svg/icon-exit-fullscreen.svg'
-      : 'assets/svg/icon-fullscreen.svg';
+    this.el['fullscreen-icon'].textContent = active ? '✕' : '⛶';
     button.setAttribute('aria-label', active ? 'Exit full screen' : 'Enter full screen');
     button.setAttribute('aria-pressed', active ? 'true' : 'false');
   };
 
-  /* ---- countdown -------------------------------------------------------- */
-
-  UI.prototype.showCountdown = function (value) {
-    this.el['countdown-value'].textContent = value > 0 ? String(value) : '';
-    this.el['countdown-overlay'].classList.toggle('is-visible', value > 0);
+  /* ---- full-screen gate -------------------------------------------------
+   * Four states, because "go full screen" is not the same request on every
+   * device:
+   *   enter       the normal case - one tap and the run starts
+   *   retry       the request was made but the browser has not switched yet
+   *   resume      full screen was left mid-run; the run is paused behind this
+   *   unsupported the browser cannot do it at all (iOS Safari on iPhone), so
+   *               the gate explains the alternative and lets play continue
+   */
+  var GATE = {
+    enter: {
+      title: 'Full screen',
+      text: 'Galaxy Gunner is played full screen, so the whole phone is playfield.',
+      button: 'Tap to play full screen',
+      skip: false,
+      note: ''
+    },
+    retry: {
+      title: 'Full screen',
+      text: 'Your browser did not switch to full screen. Tap again, or play in the window.',
+      button: 'Try again',
+      skip: true,
+      note: ''
+    },
+    resume: {
+      title: 'Paused',
+      text: 'You left full screen, so the run is paused. Go back in to carry on.',
+      button: 'Return to full screen',
+      skip: true,
+      note: ''
+    },
+    unsupported: {
+      title: 'Ready',
+      text: 'This browser has no full-screen mode, so the game fits itself to the window instead.',
+      button: 'Play',
+      skip: false,
+      note: ''
+    }
   };
 
-  UI.prototype.hideCountdown = function () {
-    this.el['countdown-overlay'].classList.remove('is-visible');
-    this.el['countdown-value'].textContent = '';
-  };
+  var IOS_NOTE = 'On iPhone: scroll up once to hide the address bar, or use ' +
+                 'Share → Add to Home Screen for a proper full-screen game.';
 
-  /* ---- mute button ------------------------------------------------------ */
+  UI.prototype.showGate = function (mode, isIos) {
+    var state = GATE[mode] || GATE.enter;
+    this.el['gate-title'].textContent = state.title;
+    this.el['gate-text'].textContent = state.text;
+    this.el['btn-gate-enter'].textContent = state.button;
+    this.el['btn-gate-skip'].hidden = !state.skip;
+
+    var note = mode === 'unsupported' && isIos ? IOS_NOTE : state.note;
+    this.el['gate-note'].textContent = note;
+    this.el['gate-note'].hidden = !note;
+
+    /* "Back" means the menu during a fresh start, but abandoning a live run
+     * when it is shown mid-game, so it is labelled honestly. */
+    this.el['btn-gate-back'].textContent = mode === 'resume' ? 'Quit to menu' : 'Back';
+
+    this.showScreen('fullscreen');
+    this.announce(state.title + '. ' + state.text);
+  };
 
   UI.prototype.syncMuteButton = function () {
     var on = this.settings.sound;
-    this.el['mute-icon'].src = on ? 'assets/svg/icon-sound.svg' : 'assets/svg/icon-muted.svg';
+    this.el['mute-icon'].textContent = on ? '♪' : '✕';
     this.el['btn-mute'].setAttribute('aria-label', on ? 'Mute sound' : 'Unmute sound');
     this.el['btn-mute'].setAttribute('aria-pressed', on ? 'false' : 'true');
     this.el['btn-mute-paused'].textContent = 'Sound: ' + (on ? 'on' : 'off');
     this.el['opt-sound'].checked = on;
   };
 
-  /* ---- game over -------------------------------------------------------- */
+  /* ---- game over ------------------------------------------------------------ */
 
   UI.prototype.showGameOver = function (stats, isNewBest) {
-    this.el['final-score'].textContent = String(stats.score);
-    this.el['stat-hits'].textContent = String(stats.hits);
-    this.el['stat-misses'].textContent = String(stats.misses);
-    this.el['stat-timeouts'].textContent = String(stats.timeouts);
-    this.el['stat-hearts'].textContent = String(stats.hearts);
+    var fmt = function (n) {
+      return n.toLocaleString ? n.toLocaleString('en-US') : String(n);
+    };
+    this.el['final-score'].textContent = fmt(stats.score);
+    this.el['stat-stage'].textContent = String(stats.stage);
+    this.el['stat-kills'].textContent = fmt(stats.kills);
+    this.el['stat-combo'].textContent = String(stats.combo);
+    this.el['stat-tier'].textContent = String(stats.tier);
+    this.el['stat-time'].textContent = formatTime(stats.timeMs);
     this.el['new-best'].hidden = !isNewBest;
     this.updateBest();
     this.showScreen('gameover');
     this.announce('Run over. Score ' + stats.score + '.' + (isNewBest ? ' New best.' : ''));
   };
 
-  /* ---- accessibility ---------------------------------------------------- */
+  function formatTime(ms) {
+    var total = Math.round(ms / 1000);
+    var m = Math.floor(total / 60);
+    var s = total % 60;
+    return m + ':' + (s < 10 ? '0' : '') + s;
+  }
+
+  /* ---- accessibility --------------------------------------------------------- */
 
   /* Throttled so a fast run does not flood a screen reader. */
   UI.prototype.announce = function (text) {
@@ -224,95 +300,11 @@
     this.liveTimer = setTimeout(function () {
       el.textContent = text;
       self.liveTimer = null;
-    }, 220);
+    }, 240);
   };
 
-  /* ---- practice coach --------------------------------------------------- */
-
-  var PRACTICE_STEPS = [
-    {
-      text: 'The white marker at the top never moves. The ring turns underneath it.',
-      advanceAfterMs: 4200
-    },
-    {
-      text: 'Press when a colour sits under the marker. Try yellow (+1) or blue (+2).',
-      completeOn: function (e) { return e.type === 'hit' && (e.sector === 'yellow' || e.sector === 'blue'); },
-      advanceAfterMs: 22000
-    },
-    {
-      text: 'Notice the ring turned the other way. Every press reverses it.',
-      completeOn: function (e) { return e.type === 'hit' || e.type === 'heal' || e.type === 'miss'; },
-      advanceAfterMs: 9000
-    },
-    {
-      text: 'The small green sector is worth +5. It is narrow, so time it carefully.',
-      completeOn: function (e) { return e.type === 'hit' && e.sector === 'green'; },
-      advanceAfterMs: 26000
-    },
-    {
-      text: 'An orange heart sometimes appears: +3 points and one heart back.',
-      completeOn: function (e) { return e.type === 'heal'; },
-      advanceAfterMs: 26000
-    },
-    {
-      text: 'Striking a dark gap costs a heart — and so does the inner ring emptying. Hearts are safe in practice.',
-      completeOn: function (e) { return e.type === 'miss'; },
-      advanceAfterMs: 20000
-    },
-    {
-      text: 'That is everything. Ready for a real run?',
-      final: true
-    }
-  ];
-
-  UI.prototype.startPractice = function () {
-    this.practice = { index: -1, elapsed: 0 };
-    this.el['practice-banner'].hidden = false;
-    this.el['practice-exit'].textContent = 'End practice';
-    this.nextPracticeStep();
-  };
-
-  UI.prototype.stopPractice = function () {
-    this.practice = null;
-    this.el['practice-banner'].hidden = true;
-  };
-
-  UI.prototype.nextPracticeStep = function () {
-    if (!this.practice) return;
-    this.practice.index++;
-    this.practice.elapsed = 0;
-    var step = PRACTICE_STEPS[this.practice.index];
-    if (!step) { this.stopPractice(); return; }
-    this.el['practice-text'].textContent = step.text;
-    if (step.final) this.el['practice-exit'].textContent = 'Start a real run';
-    this.announce(step.text);
-  };
-
-  /* Called every frame with the simulation delta while practising. */
-  UI.prototype.updatePractice = function (dt) {
-    if (!this.practice) return;
-    var step = PRACTICE_STEPS[this.practice.index];
-    if (!step || step.final) return;
-    this.practice.elapsed += dt;
-    if (step.advanceAfterMs && this.practice.elapsed >= step.advanceAfterMs) {
-      this.nextPracticeStep();
-    }
-  };
-
-  UI.prototype.practiceEvent = function (event) {
-    if (!this.practice) return;
-    var step = PRACTICE_STEPS[this.practice.index];
-    if (!step || step.final || !step.completeOn) return;
-    if (step.completeOn(event)) this.nextPracticeStep();
-  };
-
-  UI.prototype.isPracticeFinished = function () {
-    if (!this.practice) return false;
-    var step = PRACTICE_STEPS[this.practice.index];
-    return !!(step && step.final);
-  };
-
-  global.CP = global.CP || {};
-  global.CP.UI = UI;
-  global.CP.Storage = Storage;
+  global.GG = global.GG || {};
+  global.GG.UI = UI;
+  global.GG.Storage = Storage;
+  global.GG.formatTime = formatTime;
 })(window);

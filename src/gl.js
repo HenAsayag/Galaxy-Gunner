@@ -1,6 +1,10 @@
-/* Minimal WebGL plumbing: context creation, program compilation, quad buffers,
- * textures and a glyph atlas. No dependencies, WebGL 1 only, so it runs
- * anywhere the game does. */
+/* Minimal WebGL plumbing: context creation, program compilation, quad and
+ * streaming buffers, textures and a glyph atlas. No dependencies, WebGL 1
+ * only, so it runs anywhere the game does.
+ *
+ * Carried over from the previous build. The only changes for GALAXY GUNNER are
+ * a wider glyph set and the dynamic/index buffer helpers that the sprite
+ * batcher needs. */
 (function (global) {
   'use strict';
 
@@ -99,7 +103,9 @@
    * rebuilt on resize, so digits stay crisp at any DPR instead of being scaled
    * up from one baked size.
    */
-  var GLYPHS = '0123456789+';
+  var GLYPHS = "0123456789+-x.,:!?/%'" +
+               'ABCDEFGHIJKLMNOPQRSTUVWXYZ' +
+               'abcdefghijklmnopqrstuvwxyz ';
 
   function TextAtlas(gl, fontFamily) {
     this.gl = gl;
@@ -128,7 +134,7 @@
       for (var i = 0; i < 10; i++) {
         digitAdvance = Math.max(digitAdvance, ctx.measureText(String(i)).width);
       }
-      var rowHeight = Math.ceil(size.px * 1.35);
+      var rowHeight = Math.ceil(size.px * 1.45);   /* room for descenders */
       for (var g = 0; g < GLYPHS.length; g++) {
         var ch = GLYPHS[g];
         var w = Math.ceil(ctx.measureText(ch).width) + pad * 2;
@@ -188,12 +194,41 @@
     return total;
   };
 
-  global.CP = global.CP || {};
-  global.CP.gl = {
+  /* ---- streaming geometry -----------------------------------------------
+   * The sprite batcher fills one interleaved vertex buffer per frame and
+   * indexes it with a static quad index list, so a whole frame of bullets,
+   * enemies and particles costs a handful of draw calls rather than one per
+   * sprite. */
+
+  function createDynamicBuffer(gl, byteLength) {
+    var buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, byteLength, gl.DYNAMIC_DRAW);
+    return buffer;
+  }
+
+  /* 0,1,2, 0,2,3 per quad. Uploaded once and never touched again. */
+  function createQuadIndices(gl, quadCount) {
+    var data = new Uint16Array(quadCount * 6);
+    for (var i = 0; i < quadCount; i++) {
+      var v = i * 4, o = i * 6;
+      data[o] = v; data[o + 1] = v + 1; data[o + 2] = v + 2;
+      data[o + 3] = v; data[o + 4] = v + 2; data[o + 5] = v + 3;
+    }
+    var buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, data, gl.STATIC_DRAW);
+    return buffer;
+  }
+
+  global.GG = global.GG || {};
+  global.GG.gl = {
     createContext: createContext,
     createProgram: createProgram,
     createQuad: createQuad,
     createTexture: createTexture,
+    createDynamicBuffer: createDynamicBuffer,
+    createQuadIndices: createQuadIndices,
     TextAtlas: TextAtlas,
     GLYPHS: GLYPHS
   };

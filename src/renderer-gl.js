@@ -1,219 +1,112 @@
-/* WebGL renderer.
+/* WebGL sprite batcher.
  *
- * The whole playfield — flash background, ring track, every colour sector, the
- * inner countdown arc, the ripples and the fixed marker — is one fullscreen
- * quad whose fragment shader evaluates the ring analytically in polar
- * coordinates. Nothing is stroked or rasterised on the CPU, and every edge is
- * anti-aliased in the shader against its own pixel-space distance, so the arcs
- * stay clean at any device pixel ratio.
+ * The previous build drew the whole playfield as one analytic ring in a
+ * fragment shader. A bullet hell needs the opposite: thousands of small
+ * textured quads. This replaces the ring pass with a streaming batcher.
  *
- * Sprites (the heart artwork and the text glyphs) are textured quads drawn in
- * a second pass, always ON TOP of the ring, so a heart can never be covered by
- * a colour.
+ * Everything the game draws - ships, bullets, particles, pickups, the
+ * starfield, the HUD glyphs - comes out of ONE atlas texture plus one glyph
+ * atlas, so a full frame at maximum density costs roughly:
  *
- * Angles arrive in the design convention (0 = twelve o'clock, clockwise) and
- * the shader works in that convention directly: atan(x, -y).
+ *   1 draw call for the normal-blend pass
+ *   1 draw call for the additive pass
+ *   1 draw call for the text pass
+ *
+ * A batch flushes only when the texture or the blend mode changes, so the
+ * scene draws in ordered passes (background -> entities -> additive VFX ->
+ * HUD) rather than sorting per sprite.
+ *
+ * Vertex layout, 8 floats: x, y, u, v, r, g, b, a. Positions are CSS pixels
+ * with y growing downward; the vertex shader maps them to clip space.
  */
 (function (global) {
   'use strict';
 
-  var GL = global.CP.gl;
-  var Layout = global.CP.layout;
-  var Color = global.CP.color;
-  var G = global.CP.geometry;
-  var TAU = G.TAU;
+  var GL = global.GG.gl;
+  var Layout = global.GG.layout;
+  var Color = global.GG.color;
 
-  var MAX_SECTORS = 8;
-  var MAX_RIPPLES = 4;
+  var MAX_QUADS = 4000;
+  var FLOATS_PER_VERTEX = 8;
+  var FLOATS_PER_QUAD = FLOATS_PER_VERTEX * 4;
 
-  /* ---- shaders ---------------------------------------------------------- */
-
-  var QUAD_VS = [
+  var VS = [
     'attribute vec2 a_pos;',
+    'attribute vec2 a_uv;',
+    'attribute vec4 a_color;',
     'uniform vec2 u_res;',
-    'varying vec2 v_px;',
-    'void main() {',
-    /* unit quad -> clip space, and a pixel coord with y growing downward */
-    '  vec2 clip = a_pos * 2.0 - 1.0;',
-    '  v_px = vec2(a_pos.x * u_res.x, (1.0 - a_pos.y) * u_res.y);',
-    '  gl_Position = vec4(clip.x, clip.y, 0.0, 1.0);',
-    '}'
-  ].join('\n');
-
-  var SCENE_FS = [
-    'precision highp float;',
-    'varying vec2 v_px;',
-    'const float TAU = 6.283185307179586;',
-    'uniform vec2 u_center;',
-    'uniform vec2 u_shake;',
-    'uniform vec3 u_bg;',
-    'uniform vec3 u_track;',
-    'uniform float u_radius;',
-    'uniform float u_ringWidth;',
-    'uniform int u_sectorCount;',
-    /* x: start, y: span, z: widthScale, w: alpha */
-    'uniform vec4 u_sectors[' + MAX_SECTORS + '];',
-    'uniform vec3 u_sectorColor[' + MAX_SECTORS + '];',
-    /* x: start, y: sweep, z: radius, w: width */
-    'uniform vec4 u_inner;',
-    'uniform vec3 u_innerColor;',
-    'uniform int u_rippleCount;',
-    /* x: radius, y: lineWidth, z: alpha */
-    'uniform vec3 u_ripples[' + MAX_RIPPLES + '];',
-    'uniform vec3 u_rippleColor[' + MAX_RIPPLES + '];',
-    /* x: halfWidth, y: topY, z: bottomY */
-    'uniform vec3 u_marker;',
-    'uniform vec3 u_markerColor;',
-    '',
-    /* coverage of a radial band, anti-aliased over one pixel */
-    'float bandMask(float r, float center, float halfWidth) {',
-    '  float d = halfWidth - abs(r - center);',
-    '  return clamp(d + 0.5, 0.0, 1.0);',
-    '}',
-    '',
-    /* coverage of an angular wedge, measured in pixels at radius r */
-    'float wedgeMask(float ang, float start, float span, float r) {',
-    '  float halfSpan = span * 0.5;',   /* "half" is a reserved word in GLSL */
-    '  float d = mod(ang - start, TAU);',
-    '  float centered = abs(d - halfSpan);',
-    '  float insidePx = (halfSpan - centered) * max(r, 1.0);',
-    '  return clamp(insidePx + 0.5, 0.0, 1.0);',
-    '}',
-    '',
-    'void main() {',
-    '  vec3 col = u_bg;',
-    '',
-    /* the ring group carries the miss shake; the background does not */
-    '  vec2 p = (v_px - u_shake) - u_center;',
-    '  float r = length(p);',
-    '  float ang = atan(p.x, -p.y);',
-    '  if (ang < 0.0) ang += TAU;',
-    '',
-    '  float trackHalf = u_ringWidth * 0.5;',
-    '  col = mix(col, u_track, bandMask(r, u_radius, trackHalf));',
-    '',
-    '  for (int i = 0; i < ' + MAX_SECTORS + '; i++) {',
-    '    if (i < u_sectorCount) {',
-    '      vec4 s = u_sectors[i];',
-    '      float m = bandMask(r, u_radius, trackHalf * s.z) * wedgeMask(ang, s.x, s.y, r);',
-    '      col = mix(col, u_sectorColor[i], m * s.w);',
-    '    }',
-    '  }',
-    '',
-    '  float innerMask = bandMask(r, u_inner.z, u_inner.w * 0.5)',
-    '                  * wedgeMask(ang, u_inner.x, u_inner.y, r);',
-    '  col = mix(col, u_innerColor, innerMask);',
-    '',
-    /* the marker is a fixed vertical tick, drawn over the track */
-    '  float mx = clamp(u_marker.x - abs(p.x) + 0.5, 0.0, 1.0);',
-    '  float py = v_px.y - u_shake.y;',
-    '  float my = clamp(py - u_marker.y + 0.5, 0.0, 1.0)',
-    '           * clamp(u_marker.z - py + 0.5, 0.0, 1.0);',
-    '  col = mix(col, u_markerColor, mx * my);',
-    '',
-    /* ripples expand from the inner ring and are not shaken */
-    '  float rr = length(v_px - u_center);',
-    '  for (int i = 0; i < ' + MAX_RIPPLES + '; i++) {',
-    '    if (i < u_rippleCount) {',
-    '      vec3 rp = u_ripples[i];',
-    '      col = mix(col, u_rippleColor[i], bandMask(rr, rp.x, rp.y * 0.5) * rp.z);',
-    '    }',
-    '  }',
-    '',
-    '  gl_FragColor = vec4(col, 1.0);',
-    '}'
-  ].join('\n');
-
-  var SPRITE_VS = [
-    'attribute vec2 a_pos;',
-    'uniform vec2 u_res;',
-    'uniform vec4 u_rect;',   /* x, y, w, h in CSS px, y down */
-    'uniform vec4 u_uv;',     /* u0, v0, u1, v1 */
     'varying vec2 v_uv;',
+    'varying vec4 v_color;',
     'void main() {',
-    '  vec2 px = u_rect.xy + a_pos * u_rect.zw;',
-    '  vec2 clip = vec2(px.x / u_res.x, 1.0 - px.y / u_res.y) * 2.0 - 1.0;',
-    '  v_uv = mix(u_uv.xy, u_uv.zw, a_pos);',
+    '  vec2 clip = vec2(a_pos.x / u_res.x, 1.0 - a_pos.y / u_res.y) * 2.0 - 1.0;',
+    '  v_uv = a_uv;',
+    '  v_color = a_color;',
     '  gl_Position = vec4(clip, 0.0, 1.0);',
     '}'
   ].join('\n');
 
-  var SPRITE_FS = [
+  /* The atlas is uploaded premultiplied, so a tint multiplies rgb by the tint
+   * colour and the whole texel by the vertex alpha. Additive draws use the
+   * same shader with a different blend func - no second program needed. */
+  var FS = [
     'precision mediump float;',
     'varying vec2 v_uv;',
+    'varying vec4 v_color;',
     'uniform sampler2D u_tex;',
-    'uniform float u_alpha;',
-    'uniform vec3 u_tint;',
-    'uniform float u_useTint;',
     'void main() {',
     '  vec4 c = texture2D(u_tex, v_uv);',
-    /* textures are premultiplied, so tint the colour with the alpha intact */
-    '  vec3 rgb = mix(c.rgb, u_tint * c.a, u_useTint);',
-    '  gl_FragColor = vec4(rgb, c.a) * u_alpha;',
+    '  gl_FragColor = vec4(c.rgb * v_color.rgb, c.a) * v_color.a;',
     '}'
   ].join('\n');
 
-  /* ---- renderer --------------------------------------------------------- */
-
-  function RendererGL(canvas, config, images) {
+  function RendererGL(canvas, config, atlas) {
     this.canvas = canvas;
     this.config = config;
-    this.images = images || {};
+    this.atlas = atlas;
+    this.frames = atlas.frames;
+    this.backend = 'webgl';
     this.layout = null;
     this.dpr = 1;
-    this.backend = 'webgl';
+    this.lost = false;
 
     var gl = GL.createContext(canvas);
     if (!gl) throw new Error('WebGL is not available');
     this.gl = gl;
 
-    this.scene = GL.createProgram(gl, QUAD_VS, SCENE_FS);
-    this.sprite = GL.createProgram(gl, SPRITE_VS, SPRITE_FS);
-    this.quad = GL.createQuad(gl);
-    this.atlas = new GL.TextAtlas(gl, Layout.FONT);
-    this.textures = {};
-    this.atlasSizes = null;
+    this.program = GL.createProgram(gl, VS, FS);
+    this.vertices = new Float32Array(MAX_QUADS * FLOATS_PER_QUAD);
+    this.vbo = GL.createDynamicBuffer(gl, this.vertices.byteLength);
+    this.ibo = GL.createQuadIndices(gl, MAX_QUADS);
+
+    this.sheet = GL.createTexture(gl, atlas.canvas);
+    this.text = new GL.TextAtlas(gl, Layout.FONT);
+    this.textSizes = null;
+    this.textKeys = [];
+
+    this.quads = 0;
+    this.currentTexture = null;
+    this.currentBlend = 'normal';
+    this.drawCalls = 0;
 
     gl.disable(gl.DEPTH_TEST);
     gl.enable(gl.BLEND);
-    /* premultiplied-alpha blending, matching the texture upload */
-    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-
-    /* Scratch arrays reused every frame so drawing allocates nothing. */
-    this.sectorData = new Float32Array(MAX_SECTORS * 4);
-    this.sectorColors = new Float32Array(MAX_SECTORS * 3);
-    this.rippleData = new Float32Array(MAX_RIPPLES * 3);
-    this.rippleColors = new Float32Array(MAX_RIPPLES * 3);
 
     this.handleContextLost = this.handleContextLost.bind(this);
     canvas.addEventListener('webglcontextlost', this.handleContextLost);
   }
 
   RendererGL.prototype.handleContextLost = function (event) {
-    /* Nothing to restore automatically; report it rather than drawing garbage. */
     event.preventDefault();
     this.lost = true;
-    console.warn('COLOR PULSE: WebGL context lost');
+    console.warn('GALAXY GUNNER: WebGL context lost');
   };
 
-  RendererGL.prototype.texture = function (name) {
-    if (this.textures[name]) return this.textures[name];
-    var image = this.images[name];
-    if (!image) return null;
-    this.textures[name] = GL.createTexture(this.gl, image);
-    return this.textures[name];
-  };
+  /* ---- sizing ------------------------------------------------------------ */
 
-  /* ---- layout ----------------------------------------------------------- */
-
-  RendererGL.prototype.computeLayout = function (cssW, cssH) {
-    this.layout = Layout.compute(this.config, cssW, cssH);
-    return this.layout;
-  };
-
-  RendererGL.prototype.resize = function (cssW, cssH) {
+  RendererGL.prototype.resize = function (cssW, cssH, dprCap) {
     var gl = this.gl;
-    var dpr = Math.min(global.devicePixelRatio || 1, this.config.layout.maxDpr);
+    var cap = Math.min(dprCap || this.config.view.maxDpr, this.config.view.maxDpr);
+    var dpr = Math.min(global.devicePixelRatio || 1, cap);
     var pw = Math.max(1, Math.round(cssW * dpr));
     var ph = Math.max(1, Math.round(cssH * dpr));
     if (this.canvas.width !== pw || this.canvas.height !== ph) {
@@ -221,262 +114,225 @@
       this.canvas.height = ph;
     }
     this.dpr = dpr;
-    this.computeLayout(cssW, cssH);
+    this.layout = Layout.compute(this.config, cssW, cssH);
     gl.viewport(0, 0, pw, ph);
-    this.rebuildAtlas();
+    this.rebuildText();
     return this.layout;
   };
 
-  /* Glyphs are rasterised at the exact device-pixel size in use. */
-  RendererGL.prototype.rebuildAtlas = function () {
+  /* Glyphs are rasterised at the exact device-pixel sizes in use, so the score
+   * stays crisp at any DPR instead of being scaled from one baked size. */
+  RendererGL.prototype.rebuildText = function () {
     var l = this.layout;
-    var score = Math.max(8, Math.round(l.scoreFont * this.dpr));
-    var label = Math.max(8, Math.round(l.labelFont * this.dpr));
-    var key = score + ':' + label;
-    if (this.atlasSizes === key) return;
-    this.atlasSizes = key;
-    this.atlas.build([
-      { key: 'score', px: score },
-      { key: 'label', px: label }
-    ]);
+    var s = l.scale * this.dpr;
+    var sizes = [
+      { key: 'score', px: Math.max(8, Math.round(l.scoreSize * s)) },
+      { key: 'label', px: Math.max(8, Math.round(l.labelSize * s)) },
+      { key: 'banner', px: Math.max(8, Math.round(l.bannerSize * s)) }
+    ];
+    var signature = sizes.map(function (x) { return x.px; }).join(':');
+    if (this.textSizes === signature) return;
+    this.textSizes = signature;
+    this.text.build(sizes);
+    this.textKeys = ['score', 'label', 'banner'];
   };
 
-  RendererGL.prototype.heartSlot = function (index) {
-    return Layout.heartSlot(this.config, this.layout, index);
-  };
+  /* ---- frame ------------------------------------------------------------- */
 
-  RendererGL.prototype.ringPoint = function (designAngle, radius) {
-    var l = this.layout;
-    return G.pointAt(l.cx, l.cy, radius === undefined ? l.radius : radius, designAngle);
-  };
-
-  /* ---- drawing ---------------------------------------------------------- */
-
-  RendererGL.prototype.draw = function (snapshot, fx, displayScore) {
-    if (this.lost || !this.layout) return;
+  RendererGL.prototype.begin = function (clearColor) {
+    if (this.lost) return false;
     var gl = this.gl;
-    var l = this.layout;
-
+    var c = Color.unit(clearColor);
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
-    this.drawScene(snapshot, fx);
-    this.drawSprites(snapshot, fx, displayScore);
-  };
+    gl.clearColor(c[0], c[1], c[2], 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
 
-  RendererGL.prototype.drawScene = function (snapshot, fx) {
-    var gl = this.gl;
-    var l = this.layout;
-    var p = this.scene;
-    var palette = this.config.palette;
-
-    gl.useProgram(p.program);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.quad);
-    gl.enableVertexAttribArray(p.a.a_pos);
-    gl.vertexAttribPointer(p.a.a_pos, 2, gl.FLOAT, false, 0, 0);
-
-    var shake = fx.offset();
-    gl.uniform2f(p.u.u_res, l.W, l.H);
-    gl.uniform2f(p.u.u_center, l.cx, l.cy);
-    gl.uniform2f(p.u.u_shake, shake[0], shake[1]);
-    gl.uniform3fv(p.u.u_bg, Color.unit(fx.backgroundColor()));
-    gl.uniform3fv(p.u.u_track, Color.unit(palette.track));
-    gl.uniform1f(p.u.u_radius, l.radius);
-    gl.uniform1f(p.u.u_ringWidth, l.ringWidth);
-
-    /* sectors */
-    var sectors = snapshot.sectors;
-    var count = 0;
-    for (var i = 0; i < sectors.length && count < MAX_SECTORS; i++) {
-      var s = sectors[i];
-      if (s.progress <= 0.001) continue;
-      var rgb = Color.unit(s.color);
-      this.sectorData[count * 4 + 0] = s.start;
-      this.sectorData[count * 4 + 1] = s.span;
-      this.sectorData[count * 4 + 2] = 0.55 + 0.45 * s.progress;
-      this.sectorData[count * 4 + 3] = s.progress;
-      this.sectorColors[count * 3 + 0] = rgb[0];
-      this.sectorColors[count * 3 + 1] = rgb[1];
-      this.sectorColors[count * 3 + 2] = rgb[2];
-      count++;
-    }
-    gl.uniform1i(p.u.u_sectorCount, count);
-    gl.uniform4fv(p.u.u_sectors, this.sectorData);
-    gl.uniform3fv(p.u.u_sectorColor, this.sectorColors);
-
-    /* inner countdown arc */
-    var inner = this.innerArc(snapshot, fx);
-    gl.uniform4f(p.u.u_inner, inner.start, inner.sweep, l.innerRadius, inner.width);
-    gl.uniform3fv(p.u.u_innerColor, Color.unit(inner.color));
-
-    /* marker */
-    gl.uniform3f(p.u.u_marker, l.markerWidth * 0.5, l.markerTopY, l.markerBottomY);
-    gl.uniform3fv(p.u.u_markerColor, Color.unit(palette.white));
-
-    /* ripples */
-    var ripples = fx.rippleList(l.innerRadius, l.radius);
-    var rc = Math.min(ripples.length, MAX_RIPPLES);
-    for (var j = 0; j < rc; j++) {
-      var rp = ripples[j];
-      var rgbR = Color.unit(rp.color);
-      this.rippleData[j * 3 + 0] = rp.radius;
-      this.rippleData[j * 3 + 1] = rp.lineWidth;
-      this.rippleData[j * 3 + 2] = rp.alpha;
-      this.rippleColors[j * 3 + 0] = rgbR[0];
-      this.rippleColors[j * 3 + 1] = rgbR[1];
-      this.rippleColors[j * 3 + 2] = rgbR[2];
-    }
-    gl.uniform1i(p.u.u_rippleCount, rc);
-    gl.uniform3fv(p.u.u_ripples, this.rippleData);
-    gl.uniform3fv(p.u.u_rippleColor, this.rippleColors);
-
-    gl.drawArrays(gl.TRIANGLES, 0, 6);
-  };
-
-  /* Thin inner meter. Keeps a visible gap and a drifting start angle, matching
-   * the clip; its LENGTH encodes the countdown (see ASSUMPTIONS.md). */
-  RendererGL.prototype.innerArc = function (snapshot, fx) {
-    var l = this.layout;
-    var rules = this.config.rules;
-    var palette = this.config.palette;
-
-    var gap = G.degToRad(rules.innerGapDeg);
-    var available = TAU - gap;
-    var fraction = rules.timerMode === 'countdown' ? snapshot.timerFraction : 0.88;
-    var sweep = Math.max(0.0001, available * fraction);
-    var base = G.norm(snapshot.simTime / 1000 * rules.innerRotateRadPerSec + gap / 2);
-
-    /* green -> lime -> yellow as the interval runs out */
-    var color = fraction > 0.5
-      ? Color.mix(palette.lime, palette.green, (fraction - 0.5) / 0.5)
-      : Color.mix(palette.yellow, palette.lime, fraction / 0.5);
-
-    var pulse = fx.timerPulseAmount();
-    if (pulse > 0) color = Color.mix(color, '#DFFFE4', pulse * 0.75);
-
-    return {
-      start: base,
-      sweep: sweep,
-      width: l.innerWidth * (1 + pulse * 0.5),
-      color: color
-    };
-  };
-
-  /* ---- sprite pass ------------------------------------------------------ */
-
-  RendererGL.prototype.beginSprites = function () {
-    var gl = this.gl;
-    var p = this.sprite;
-    gl.useProgram(p.program);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.quad);
-    gl.enableVertexAttribArray(p.a.a_pos);
-    gl.vertexAttribPointer(p.a.a_pos, 2, gl.FLOAT, false, 0, 0);
-    gl.uniform2f(p.u.u_res, this.layout.W, this.layout.H);
+    gl.useProgram(this.program.program);
+    gl.uniform2f(this.program.u.u_res, this.layout.W, this.layout.H);
     gl.activeTexture(gl.TEXTURE0);
-    gl.uniform1i(p.u.u_tex, 0);
+    gl.uniform1i(this.program.u.u_tex, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.ibo);
+    var stride = FLOATS_PER_VERTEX * 4;
+    var a = this.program.a;
+    gl.enableVertexAttribArray(a.a_pos);
+    gl.vertexAttribPointer(a.a_pos, 2, gl.FLOAT, false, stride, 0);
+    gl.enableVertexAttribArray(a.a_uv);
+    gl.vertexAttribPointer(a.a_uv, 2, gl.FLOAT, false, stride, 8);
+    gl.enableVertexAttribArray(a.a_color);
+    gl.vertexAttribPointer(a.a_color, 4, gl.FLOAT, false, stride, 16);
+
+    this.quads = 0;
+    this.currentTexture = null;
+    this.drawCalls = 0;
+    this.currentBlend = null;      /* force the first setBlend to take effect */
+    this.setBlend('normal');
+    return true;
   };
 
-  RendererGL.prototype.blit = function (texture, x, y, w, h, uv, alpha, tint) {
-    if (!texture) return;
+  RendererGL.prototype.setBlend = function (mode) {
+    if (mode === this.currentBlend) return;
+    if (this.quads) this.flush();
     var gl = this.gl;
-    var p = this.sprite;
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.uniform4f(p.u.u_rect, x, y, w, h);
-    gl.uniform4f(p.u.u_uv, uv[0], uv[1], uv[2], uv[3]);
-    gl.uniform1f(p.u.u_alpha, alpha === undefined ? 1 : alpha);
-    if (tint) {
-      gl.uniform3fv(p.u.u_tint, tint);
-      gl.uniform1f(p.u.u_useTint, 1);
-    } else {
-      gl.uniform1f(p.u.u_useTint, 0);
-    }
-    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    /* Both paths assume premultiplied source. Additive simply skips the
+     * destination attenuation, which is what makes overlapping muzzle flashes
+     * and explosions bloom instead of flatten. */
+    if (mode === 'add') gl.blendFunc(gl.ONE, gl.ONE);
+    else gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    this.currentBlend = mode;
   };
 
-  var FULL_UV = [0, 0, 1, 1];
+  RendererGL.prototype.flush = function () {
+    if (!this.quads || !this.currentTexture) { this.quads = 0; return; }
+    var gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, this.currentTexture);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0,
+      this.vertices.subarray(0, this.quads * FLOATS_PER_QUAD));
+    gl.drawElements(gl.TRIANGLES, this.quads * 6, gl.UNSIGNED_SHORT, 0);
+    this.drawCalls++;
+    this.quads = 0;
+  };
 
-  RendererGL.prototype.drawSprites = function (snapshot, fx, displayScore) {
+  RendererGL.prototype.end = function () {
+    this.flush();
+  };
+
+  /* ---- quad emission ------------------------------------------------------
+   * `push` takes four already-transformed corners so rotation, scaling and
+   * the world->CSS mapping all happen once, on the caller's side. */
+
+  RendererGL.prototype.use = function (texture) {
+    if (texture === this.currentTexture) return;
+    if (this.quads) this.flush();
+    this.currentTexture = texture;
+  };
+
+  RendererGL.prototype.push = function (x0, y0, x1, y1, x2, y2, x3, y3,
+                                        u0, v0, u1, v1, r, g, b, a) {
+    if (this.quads >= MAX_QUADS) this.flush();
+    var v = this.vertices;
+    var o = this.quads * FLOATS_PER_QUAD;
+    v[o] = x0; v[o + 1] = y0; v[o + 2] = u0; v[o + 3] = v0;
+    v[o + 4] = r; v[o + 5] = g; v[o + 6] = b; v[o + 7] = a;
+    v[o + 8] = x1; v[o + 9] = y1; v[o + 10] = u1; v[o + 11] = v0;
+    v[o + 12] = r; v[o + 13] = g; v[o + 14] = b; v[o + 15] = a;
+    v[o + 16] = x2; v[o + 17] = y2; v[o + 18] = u1; v[o + 19] = v1;
+    v[o + 20] = r; v[o + 21] = g; v[o + 22] = b; v[o + 23] = a;
+    v[o + 24] = x3; v[o + 25] = y3; v[o + 26] = u0; v[o + 27] = v1;
+    v[o + 28] = r; v[o + 29] = g; v[o + 30] = b; v[o + 31] = a;
+    this.quads++;
+  };
+
+  /* ---- the public drawing interface --------------------------------------
+   * renderer-2d.js implements exactly these five methods, so src/scene.js is
+   * written once and runs on either backend. */
+
+  var WHITE = [1, 1, 1];
+
+  /* x, y are the sprite CENTRE in world units. */
+  RendererGL.prototype.sprite = function (name, x, y, scale, rotation, tint, alpha, blend) {
+    var f = this.frames[name];
+    if (!f) return;
+    this.setBlend(blend || 'normal');
+    this.use(this.sheet);
+
     var l = this.layout;
-    this.beginSprites();
+    var s = l.scale * (scale === undefined ? 1 : scale);
+    var hw = f.dw * 0.5 * s;
+    var hh = f.dh * 0.5 * s;
+    var cx = (x + l.offsetX) * l.scale;
+    var cy = y * l.scale;
+    var c = tint ? Color.unit(tint) : WHITE;
+    var a = alpha === undefined ? 1 : alpha;
 
-    /* Heart badges ride the orange collectible. Drawn in the sprite pass, so
-     * they sit above EVERY arc: a heart is never covered by a colour. */
-    var shake = fx.offset();
-    var badge = this.texture('heart-pickup');
-    for (var i = 0; i < snapshot.sectors.length; i++) {
-      var s = snapshot.sectors[i];
-      if (!s.heals || s.progress <= 0.001) continue;
-      var point = G.pointAt(l.cx + shake[0], l.cy + shake[1], l.radius, s.start + s.span / 2);
-      var size = l.ringWidth * 0.86 * (0.6 + 0.4 * s.progress);
-      this.blit(badge, point.x - size / 2, point.y - size / 2, size, size, FULL_UV, s.progress);
+    if (!rotation) {
+      this.push(cx - hw, cy - hh, cx + hw, cy - hh, cx + hw, cy + hh, cx - hw, cy + hh,
+                f.u0, f.v0, f.u1, f.v1, c[0], c[1], c[2], a);
+      return;
     }
-
-    /* HUD: score, hearts, labels. Never shaken, so the digits stay readable. */
-    this.drawScore(displayScore, fx.scoreScale());
-    this.drawHearts(snapshot.lives, fx);
-    this.drawLabels(fx);
-
-    /* The collected heart lands last of all, so nothing can cover it. */
-    var flights = fx.flightList(this.heartSlot.bind(this), l.heartSize);
-    var heartTex = this.texture('heart-full');
-    for (var f = 0; f < flights.length; f++) {
-      var fl = flights[f];
-      this.blit(heartTex, fl.x - fl.size / 2, fl.y - fl.size / 2, fl.size, fl.size, FULL_UV, fl.alpha);
-    }
+    var co = Math.cos(rotation), si = Math.sin(rotation);
+    var xw = hw * co, yw = hw * si;
+    var xh = hh * si, yh = hh * co;
+    this.push(cx - xw + xh, cy - yw - yh,
+              cx + xw + xh, cy + yw - yh,
+              cx + xw - xh, cy + yw + yh,
+              cx - xw - xh, cy - yw + yh,
+              f.u0, f.v0, f.u1, f.v1, c[0], c[1], c[2], a);
   };
 
-  /* Text is drawn glyph by glyph from the atlas, on a fixed tabular advance so
-   * a count-up never shifts the number sideways. */
-  RendererGL.prototype.drawText = function (text, key, centerX, centerY, color, alpha, scale) {
-    var set = this.atlas.sets[key];
+  /* Independent axis scaling, for beams and stretched trails. */
+  RendererGL.prototype.spriteScaled = function (name, x, y, sx, sy, rotation, tint, alpha, blend) {
+    var f = this.frames[name];
+    if (!f) return;
+    this.setBlend(blend || 'normal');
+    this.use(this.sheet);
+
+    var l = this.layout;
+    var hw = f.dw * 0.5 * sx * l.scale;
+    var hh = f.dh * 0.5 * sy * l.scale;
+    var cx = (x + l.offsetX) * l.scale;
+    var cy = y * l.scale;
+    var c = tint ? Color.unit(tint) : WHITE;
+    var a = alpha === undefined ? 1 : alpha;
+    var co = Math.cos(rotation || 0), si = Math.sin(rotation || 0);
+    var xw = hw * co, yw = hw * si;
+    var xh = hh * si, yh = hh * co;
+    this.push(cx - xw + xh, cy - yw - yh,
+              cx + xw + xh, cy + yw - yh,
+              cx + xw - xh, cy + yw + yh,
+              cx - xw - xh, cy - yw + yh,
+              f.u0, f.v0, f.u1, f.v1, c[0], c[1], c[2], a);
+  };
+
+  /* Axis-aligned solid rectangle in world units (HUD bars, letterbox fill). */
+  RendererGL.prototype.rect = function (x, y, w, h, tint, alpha, blend) {
+    var f = this.frames.px;
+    this.setBlend(blend || 'normal');
+    this.use(this.sheet);
+    var l = this.layout;
+    var x0 = (x + l.offsetX) * l.scale, y0 = y * l.scale;
+    var x1 = x0 + w * l.scale, y1 = y0 + h * l.scale;
+    var c = tint ? Color.unit(tint) : WHITE;
+    /* Inset by a texel so the sampler cannot bleed a neighbour into the fill. */
+    var du = (f.u1 - f.u0) * 0.25, dv = (f.v1 - f.v0) * 0.25;
+    this.push(x0, y0, x1, y0, x1, y1, x0, y1,
+              f.u0 + du, f.v0 + dv, f.u1 - du, f.v1 - dv,
+              c[0], c[1], c[2], alpha === undefined ? 1 : alpha);
+  };
+
+  /* align: -1 left, 0 centre, 1 right. `size` selects a baked glyph row. */
+  RendererGL.prototype.drawText = function (text, size, x, y, tint, alpha, align, scale) {
+    var set = this.text.sets[size];
     if (!set) return;
+    this.setBlend('normal');
+    this.use(this.text.texture);
+
+    var l = this.layout;
     scale = scale === undefined ? 1 : scale;
     var toCss = scale / this.dpr;
-    var total = this.atlas.measure(key, text) * toCss;
-    var x = centerX - total / 2;
-    var tint = Color.unit(color);
-    var texture = this.atlas.texture;
+    var total = this.text.measure(size, text) * toCss;
+    var px = (x + l.offsetX) * l.scale;
+    var py = y * l.scale;
+    var cursor = align === 1 ? px - total : align === -1 ? px : px - total / 2;
+    var c = tint ? Color.unit(tint) : WHITE;
+    var a = alpha === undefined ? 1 : alpha;
 
     for (var i = 0; i < text.length; i++) {
       var g = set.glyphs[text[i]];
       if (!g) continue;
-      var w = g.w * toCss;
-      var h = g.h * toCss;
-      /* the glyph was drawn `pad` in from its cell, centred vertically */
-      this.blit(texture, x - g.pad * toCss, centerY - h / 2, w, h,
-                [g.u0, g.v0, g.u1, g.v1], alpha, tint);
-      x += g.advance * toCss;
+      var w = g.w * toCss, h = g.h * toCss;
+      var gx = cursor - g.pad * toCss, gy = py - h / 2;
+      this.push(gx, gy, gx + w, gy, gx + w, gy + h, gx, gy + h,
+                g.u0, g.v0, g.u1, g.v1, c[0], c[1], c[2], a);
+      cursor += g.advance * toCss;
     }
   };
 
-  RendererGL.prototype.drawScore = function (value, scale) {
-    var l = this.layout;
-    this.drawText(String(Math.max(0, Math.round(value))), 'score',
-                  l.cx, l.scoreY, this.config.palette.white, 1, scale);
+  RendererGL.prototype.measureText = function (text, size) {
+    return this.text.measure(size, text) / this.dpr / this.layout.scale;
   };
 
-  RendererGL.prototype.drawLabels = function (fx) {
-    var l = this.layout;
-    var labels = fx.labelList();
-    var margin = 18;
-    for (var i = 0; i < labels.length; i++) {
-      var lb = labels[i];
-      /* final guard: a label can never be drawn off the playfield */
-      var x = Math.max(margin, Math.min(l.W - margin, l.cx + lb.dx));
-      this.drawText(lb.text, 'label', x, l.labelY - lb.rise, lb.color, lb.alpha, 1);
-    }
-  };
-
-  RendererGL.prototype.drawHearts = function (lives, fx) {
-    var l = this.layout;
-    var count = this.config.rules.maxLives;
-    for (var i = 0; i < count; i++) {
-      var filled = i < lives;
-      var texture = this.texture(filled ? 'heart-full' : 'heart-empty');
-      var slot = this.heartSlot(i);
-      var size = l.heartSize * fx.heartScale(i);
-      this.blit(texture, slot.x - size / 2, slot.y - size / 2, size, size, FULL_UV, 1);
-    }
-  };
-
-  global.CP = global.CP || {};
-  global.CP.RendererGL = RendererGL;
+  global.GG = global.GG || {};
+  global.GG.RendererGL = RendererGL;
 })(window);

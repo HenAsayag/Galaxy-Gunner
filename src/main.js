@@ -1,24 +1,39 @@
 /* Boot and orchestration: one animation loop, one simulation clock, one set
- * of event listeners for the lifetime of the page. */
+ * of event listeners for the lifetime of the page.
+ *
+ * The shape of this file is carried over from the previous build - the boot
+ * promise chain, the resize handling, the visibility/blur auto-pause, the
+ * full-screen negotiation and the WebGL-with-Canvas-fallback selection were
+ * all working and none of them are gameplay-specific. What changed is what
+ * gets constructed and what the loop drives.
+ */
 (function (global) {
   'use strict';
 
-  var CP = global.CP;
-  var CONFIG = CP.CONFIG;
+  var GG = global.GG;
+  var CONFIG = GG.CONFIG;
 
-  var ui, game, renderer, fx, audio, input, images;
-  var displayScore = 0;
+  var ui, world, renderer, scene, fx, audio, input, quality, atlas;
   var lastFrame = 0;
   var gameOverAt = 0;
   var gameOverStats = null;
-  var GAME_OVER_SETTLE_MS = 700;
+  var GAME_OVER_SETTLE_MS = 900;
   var booted = false;
   var suppressBlurUntil = 0;
   var fullscreenBlocked = false;
+  var gateMode = null;          /* null when the gate is not on screen */
+  var gateWaitTimer = null;
 
-  var HIT_SOUND = { yellow: 'hit-yellow', blue: 'hit-blue', green: 'hit-green' };
+  /* iOS Safari on iPhone has no element full-screen API. Detected rather than
+   * assumed, because the advice the gate gives there is different. */
+  var IS_IOS = (function () {
+    var ua = global.navigator.userAgent || '';
+    if (/iPad|iPhone|iPod/.test(ua)) return true;
+    /* iPadOS 13+ reports itself as a Mac, but a Mac has no touch screen. */
+    return global.navigator.platform === 'MacIntel' && global.navigator.maxTouchPoints > 1;
+  })();
 
-  /* ---- config ----------------------------------------------------------- */
+  /* ---- config -------------------------------------------------------------- */
 
   /* Tuning can live in config/game-config.json when the game is served over
    * http(s). Opened from file:// the fetch fails and the built-in defaults
@@ -27,170 +42,243 @@
     if (typeof fetch !== 'function') return Promise.resolve();
     return fetch('config/game-config.json')
       .then(function (res) { return res.ok ? res.json() : null; })
-      .then(function (json) { if (json) CP.applyKitJson(CONFIG, json); })
+      .then(function (json) { if (json) GG.mergeConfig(CONFIG, json); })
       .catch(function () { /* defaults already loaded */ });
   }
 
-  /* ---- settings --------------------------------------------------------- */
+  /* ---- settings ------------------------------------------------------------- */
 
   function applySettings() {
     var s = ui.settings;
     audio.setMuted(!s.sound);
+    if (s.music) audio.startMusic(); else audio.stopMusic();
     fx.reducedMotion = s.reducedMotion;
     fx.reducedFlash = s.reducedFlash || s.reducedMotion;
-    CONFIG.rules.timerMode = s.decorativeTimer ? 'decorative' : 'countdown';
+    if (s.quality === 'auto') quality.setAuto();
+    else quality.set(s.quality, true);
     ui.syncMuteButton();
   }
 
-  /* ---- game events ------------------------------------------------------ */
+  function onQualityChange(level) {
+    fx.applyQuality(level);
+    scene.setQuality(level);
+    resize();
+  }
 
-  function onGameEvent(type, payload) {
+  /* ---- game events ----------------------------------------------------------- */
+
+  function onWorldEvent(type, payload) {
     switch (type) {
-      case 'hit':
-        fx.onHit(payload);
-        audio.play(HIT_SOUND[payload.sector] || 'hit-green');
-        ui.announce('Plus ' + payload.points + '. Score ' + payload.score + '.');
-        ui.practiceEvent(payload);
+      case 'pickup':
+        if (payload.label) ui.announce(payload.label);
         break;
 
-      case 'heal':
-        fx.onHeal(payload);
-        audio.play('heal');
-        if (payload.healed) {
-          var slotIndex = payload.lives - 1;
-          var point = renderer.ringPoint(payload.angle);
-          fx.heartFlight(point.x, point.y, slotIndex);
-          fx.heartPop(slotIndex);
-        }
-        ui.announce('Plus ' + payload.points + (payload.healed ? ', heart restored.' : '.'));
-        ui.practiceEvent(payload);
+      case 'hurt':
+        ui.announce(payload.lives + ' lives left.');
         break;
 
-      case 'miss':
-        fx.onMiss(payload);
-        audio.play('miss');
-        ui.announce(payload.cause === 'timeout' ? 'Out of time.' : 'Missed.');
-        ui.practiceEvent(payload);
-        break;
-
-      case 'countdown-start':
-        ui.showCountdown(CONFIG.rules.countdownSeconds);
-        input.setEnabled(false);
-        break;
-
-      case 'countdown-tick':
-        ui.showCountdown(payload.value);
-        audio.play('countdown');
-        break;
-
-      case 'countdown-end':
-        ui.hideCountdown();
-        input.setEnabled(true);
+      case 'bomb':
+        ui.setBombCount(payload.bombs);
         break;
 
       case 'gameover':
         gameOverStats = payload;
         gameOverAt = performance.now();
         input.setEnabled(false);
-        audio.play('game-over');
+        audio.play('gameover');
+        audio.duckMusic(true);
         break;
     }
   }
 
-  /* ---- run control ------------------------------------------------------ */
+  /* ---- run control ------------------------------------------------------------ */
 
-  function startRun(options) {
-    options = options || {};
-    /* Clear every transient: effects, tweens, latches, HUD chrome. */
+  /* ---- the full-screen gate -------------------------------------------------
+   * Nothing starts a run directly any more; everything goes through here. A
+   * phone's address bar eats roughly a third of a portrait viewport, and this
+   * game is sized to what is actually visible, so playing windowed on a phone
+   * is a materially worse game. */
+
+  function requestPlay() {
+    if (!fullscreenSupported()) {
+      /* Cannot be done here at all. Say so plainly and let them play. */
+      openGate('unsupported');
+      return;
+    }
+    if (fullscreenActive()) { startRun(); return; }
+    openGate('enter');
+  }
+
+  function openGate(mode) {
+    gateMode = mode;
+    clearGateWait();
+    input.setEnabled(false);
+    ui.setGameplayChromeVisible(false);
+    ui.showGate(mode, IS_IOS);
+  }
+
+  function closeGate() {
+    gateMode = null;
+    clearGateWait();
+  }
+
+  function clearGateWait() {
+    if (gateWaitTimer) { clearTimeout(gateWaitTimer); gateWaitTimer = null; }
+  }
+
+  /* The gate's main button. Must call requestFullscreen synchronously inside
+   * this handler or every browser will refuse it. */
+  function onGateEnter() {
+    if (gateMode === 'unsupported') {
+      closeGate();
+      startRun();
+      return;
+    }
+    toggleFullscreen();
+    /* If the switch has not happened shortly, offer the way out rather than
+     * leaving a dead button. The fullscreenchange handler cancels this. */
+    clearGateWait();
+    gateWaitTimer = setTimeout(function () {
+      gateWaitTimer = null;
+      if (gateMode && !fullscreenActive()) openGate(gateMode === 'resume' ? 'resume' : 'retry');
+    }, 1400);
+  }
+
+  function onGateSkip() {
+    var wasResume = gateMode === 'resume';
+    closeGate();
+    if (wasResume) resumeGame(); else startRun();
+  }
+
+  function onGateBack() {
+    closeGate();
+    toMenu();
+  }
+
+  /* Android Chrome allows an orientation lock once full screen is active.
+   * Portrait is the primary presentation, so take it when it is offered and
+   * ignore the refusal everywhere else. */
+  function lockPortrait() {
+    try {
+      var orientation = global.screen && global.screen.orientation;
+      if (!orientation || !orientation.lock) return;
+      var result = orientation.lock('portrait');
+      if (result && result.catch) result.catch(function () {});
+    } catch (e) { /* not supported, or not allowed here */ }
+  }
+
+  function startRun() {
+    closeGate();
     fx.clear();
-    displayScore = 0;
     gameOverStats = null;
     gameOverAt = 0;
-    ui.hideCountdown();
+    input.reset();
+    input.setEnabled(true);
     ui.showScreen(null);
     ui.setGameplayChromeVisible(true);
 
-    if (options.practice) ui.startPractice(); else ui.stopPractice();
-
-    game.practice = !!options.practice;
-    game.start(performance.now(), {
-      practice: !!options.practice,
-      seed: CONFIG.rules.seed || undefined
-    });
+    resize();                       /* the world needs live dimensions first */
+    world.start(performance.now(), {});
+    scene.displayScore = 0;
+    ui.setBombCount(world.player.bombs);
+    audio.duckMusic(false);
+    if (ui.settings.music) audio.startMusic();
   }
 
   function toMenu() {
     input.setEnabled(false);
     fx.clear();
-    ui.stopPractice();
-    ui.hideCountdown();
     ui.setGameplayChromeVisible(false);
-    game.state = 'idle';
+    /* A full reset, not just a state flip: otherwise the last run's enemies
+     * and bullets sit frozen behind the menu panel. */
+    world.reset(performance.now());
     audio.suspendGameplay();
+    audio.duckMusic(true);
     ui.showScreen('menu');
   }
 
   function pauseGame(reason) {
-    if (!game.isLive()) return;
-    if (!game.pause(performance.now(), reason)) return;
+    if (!world.isLive()) return;
+    if (!world.pause(performance.now(), reason)) return;
     input.setEnabled(false);
-    ui.hideCountdown();
     audio.suspendGameplay();
+    audio.duckMusic(true);
     audio.play('pause');
     ui.showScreen('paused');
   }
 
   function resumeGame() {
-    if (game.state !== 'paused') return;
+    if (world.state !== 'paused') return;
     ui.showScreen(null);
-    audio.play('resume');
-    game.resume(performance.now());   /* re-enters the 3-2-1 countdown */
+    input.setEnabled(true);
+    audio.resumeContext();
+    audio.duckMusic(false);
+    audio.play('ui');
+    world.resume(performance.now());
   }
 
   function togglePause() {
-    if (game.state === 'paused') resumeGame();
-    else if (game.isLive()) pauseGame('manual');
+    if (world.state === 'paused') resumeGame();
+    else if (world.isLive()) pauseGame('manual');
   }
 
-  /* ---- loop ------------------------------------------------------------- */
+  function useBomb() {
+    if (!world.isLive()) return;
+    if (world.useBomb()) ui.setBombCount(world.player.bombs);
+  }
+
+  /* ---- loop --------------------------------------------------------------------- */
 
   function frame(now) {
     global.requestAnimationFrame(frame);
 
-    var realDelta = lastFrame ? Math.min(100, now - lastFrame) : 0;
+    var rawDelta = lastFrame ? now - lastFrame : 0;
+    var realDelta = Math.min(120, rawDelta);
     lastFrame = now;
 
-    game.advanceTo(now);
+    if (world.isLive()) {
+      /* The watchdog gets the RAW delta. Handing it the clamped one would feed
+       * it a run of exactly-120 ms frames after every tab stall or GC pause,
+       * which reads as a slow device and would quietly demote a machine that
+       * is in fact running at 60. */
+      quality.sample(rawDelta);
+      /* One read per frame, shared by every simulation slice inside it. */
+      world.input = input.read(world.player, renderer.layout, realDelta,
+                               CONFIG.player.fingerOffsetY);
+    }
+
+    world.advanceTo(now);
 
     /* Effects run on the simulation: they stop dead while paused, and keep
-     * settling for a moment after the final miss. */
-    var fxDelta = game.state === 'paused' ? 0 : realDelta;
+     * settling for a moment after the final explosion. */
+    var fxDelta = world.state === 'paused' ? 0 : realDelta;
     fx.update(fxDelta);
-    if (game.state === 'playing' && ui.practice) ui.updatePractice(realDelta);
+    if (world.state !== 'paused') {
+      scene.background.update(fxDelta, renderer.layout.worldW, renderer.layout.worldH);
+    }
 
     /* Score count-up. The authoritative score already changed; this only
      * chases it, and always converges, so no award can be lost. */
-    var target = game.score;
-    if (displayScore !== target) {
-      var tau = Math.max(1, CONFIG.effects.scoreCountUpMs / 3);
-      displayScore += (target - displayScore) * (1 - Math.exp(-fxDelta / tau));
-      if (Math.abs(target - displayScore) < 0.5) displayScore = target;
+    if (scene.displayScore !== world.score) {
+      var tau = Math.max(1, CONFIG.feel.scoreCountUpMs / 3);
+      scene.displayScore += (world.score - scene.displayScore) *
+                            (1 - Math.exp(-fxDelta / tau));
+      if (Math.abs(world.score - scene.displayScore) < 0.6) scene.displayScore = world.score;
     }
 
-    var snapshot = game.snapshot();
-    renderer.draw(snapshot, fx, displayScore);
+    scene.draw(renderer, world, fx, ui);
 
-    /* Reveal the game-over screen only once the last flash has settled. */
+    /* Reveal the game-over screen only once the last explosion has settled. */
     if (gameOverStats && now - gameOverAt >= GAME_OVER_SETTLE_MS) {
       var stats = gameOverStats;
       gameOverStats = null;
-      displayScore = stats.score;
+      scene.displayScore = stats.score;
       ui.setGameplayChromeVisible(false);
-      ui.showGameOver(stats, ui.recordBest(stats.score));
+      ui.showGameOver(stats, ui.recordBest(stats.score, stats.stage));
     }
   }
 
-  /* ---- sizing ----------------------------------------------------------- */
+  /* ---- sizing --------------------------------------------------------------------- */
 
   function resize() {
     var app = ui.el.app;
@@ -198,10 +286,17 @@
     var styles = global.getComputedStyle(app);
     var w = rect.width - parseFloat(styles.paddingLeft) - parseFloat(styles.paddingRight);
     var h = rect.height - parseFloat(styles.paddingTop) - parseFloat(styles.paddingBottom);
-    renderer.resize(Math.max(1, w), Math.max(1, h));
+    var layout = renderer.resize(Math.max(1, w), Math.max(1, h), quality.dprCap());
+    world.setViewport(layout.worldW, layout.worldH);
+
+    /* In landscape the playfield is a centred column with background painted
+     * into the margins. The DOM chrome has to follow that column, or the pause
+     * and bomb buttons end up stranded half a screen away from the action. */
+    app.style.setProperty('--field-inset',
+      Math.round(layout.offsetX * layout.scale) + 'px');
   }
 
-  /* ---- wiring ----------------------------------------------------------- */
+  /* ---- wiring ---------------------------------------------------------------------- */
 
   function wireControls() {
     var el = ui.el;
@@ -210,36 +305,28 @@
       if (!node) return;
       node.addEventListener('click', function (event) {
         event.preventDefault();
-        if (!silent) audio.play('tap');
+        if (!silent) audio.play('ui');
         handler(event);
       });
     };
 
-    click(el['btn-play'], function () { startRun({}); });
+    /* Every entry point into a run goes through the gate. */
+    click(el['btn-play'], requestPlay);
+    click(el['btn-restart-paused'], requestPlay);
+    click(el['btn-restart'], requestPlay);
+
     click(el['btn-howto'], function () { ui.showScreen('howto'); });
     click(el['btn-howto-back'], function () { ui.showScreen('menu'); });
-    click(el['btn-practice'], function () { startRun({ practice: true }); });
-    click(el['btn-howto-practice'], function () { startRun({ practice: true }); });
+
+    click(el['btn-gate-enter'], onGateEnter, true);
+    click(el['btn-gate-skip'], onGateSkip);
+    click(el['btn-gate-back'], onGateBack);
 
     click(el['btn-pause'], function () { pauseGame('manual'); }, true);
     click(el['btn-resume'], resumeGame, true);
-    click(el['btn-restart-paused'], function () { startRun({}); });
     click(el['btn-menu-paused'], toMenu);
-    click(el['btn-restart'], function () { startRun({}); });
     click(el['btn-menu'], toMenu);
-
-    click(el['practice-exit'], function () {
-      if (ui.isPracticeFinished()) startRun({});
-      else toMenu();
-    });
-
-    /* The TAP button is a labelled alias for striking the playfield. */
-    el['tap-button'].addEventListener('pointerdown', function (event) {
-      if (event.isPrimary === false) return;
-      if (event.pointerType === 'mouse' && event.button !== 0) return;
-      event.preventDefault();
-      onStrike(CP.eventTime(event));
-    });
+    click(el['btn-bomb'], useBomb, true);
 
     var toggleMute = function () {
       ui.settings.sound = !ui.settings.sound;
@@ -250,50 +337,35 @@
     click(el['btn-mute'], toggleMute, true);
     click(el['btn-mute-paused'], toggleMute, true);
 
-    el['opt-sound'].addEventListener('change', function (e) {
-      ui.settings.sound = e.target.checked;
-      ui.saveSettings();
-      applySettings();
-    });
-    el['opt-reduced-motion'].addEventListener('change', function (e) {
-      ui.settings.reducedMotion = e.target.checked;
-      ui.saveSettings();
-      applySettings();
-    });
-    el['opt-reduced-flash'].addEventListener('change', function (e) {
-      ui.settings.reducedFlash = e.target.checked;
-      ui.saveSettings();
-      applySettings();
-    });
-    el['opt-decorative-timer'].addEventListener('change', function (e) {
-      ui.settings.decorativeTimer = e.target.checked;
+    var bindToggle = function (id, key) {
+      el[id].addEventListener('change', function (e) {
+        ui.settings[key] = e.target.checked;
+        ui.saveSettings();
+        applySettings();
+      });
+    };
+    bindToggle('opt-sound', 'sound');
+    bindToggle('opt-music', 'music');
+    bindToggle('opt-reduced-motion', 'reducedMotion');
+    bindToggle('opt-reduced-flash', 'reducedFlash');
+
+    el['opt-quality'].addEventListener('change', function (e) {
+      ui.settings.quality = e.target.value;
       ui.saveSettings();
       applySettings();
     });
   }
 
-  function onStrike(timeStamp) {
-    if (game.state !== 'playing') return;
-    /* Advance to the instant of the press, then judge against that angle, so
-     * feedback starts on the same frame as the input. */
-    var clamped = Math.max(game.lastNow, Math.min(timeStamp, performance.now()));
-    game.advanceTo(clamped);
-    game.press(clamped);
-  }
-
-  /* ---- full screen ------------------------------------------------------ */
-
-  /* Mostly for phones: a browser's address bar eats a good part of a portrait
+  /* ---- full screen ------------------------------------------------------------------
+   * Mostly for phones: a browser's address bar eats a good part of a portrait
    * viewport, and the playfield is sized to what is actually visible. iOS
    * Safari on iPhone has no element full-screen API, so the button stays
    * hidden there rather than offering something that cannot work. */
+
   function fullscreenSupported() {
     if (fullscreenBlocked) return false;
     var el = document.documentElement;
     if (!(el.requestFullscreen || el.webkitRequestFullscreen)) return false;
-    /* False inside an iframe without allowfullscreen, and on some embedded
-     * webviews. Not every host reports it honestly, hence fullscreenBlocked
-     * below as the second line of defence. */
     var enabled = document.fullscreenEnabled;
     if (enabled === undefined) enabled = document.webkitFullscreenEnabled;
     return enabled !== false;
@@ -303,7 +375,6 @@
     return !!(document.fullscreenElement || document.webkitFullscreenElement);
   }
 
-  /* Shown on touch devices and narrow windows, where it actually helps. */
   function fullscreenRelevant() {
     if (!fullscreenSupported()) return false;
     var coarse = false;
@@ -313,13 +384,38 @@
 
   function syncFullscreen() {
     ui.syncFullscreenButton(fullscreenRelevant(), fullscreenActive());
-    ui.setGameplayChromeVisible(game.isLive() || game.state === 'paused');
+    var inGate = gateMode !== null;
+    ui.setGameplayChromeVisible(!inGate && (world.isLive() || world.state === 'paused'));
   }
 
-  /* A host that refuses the request (an embedded webview, a restrictive
-   * permissions policy) should not leave a dead button on screen. */
+  /* Everything that reacts to the browser entering or leaving full screen,
+   * including the gate opening and closing itself. */
+  function onFullscreenChange() {
+    var active = fullscreenActive();
+
+    if (active && gateMode) {
+      clearGateWait();
+      var wasResume = gateMode === 'resume';
+      closeGate();
+      lockPortrait();
+      if (wasResume) resumeGame(); else startRun();
+    } else if (!active && !gateMode && fullscreenSupported() &&
+               (world.isLive() || world.state === 'paused')) {
+      /* Left full screen mid-run: pause behind the gate rather than letting
+       * the run continue in a viewport that just changed height. */
+      if (world.isLive()) pauseGame('fullscreen');
+      openGate('resume');
+    }
+
+    syncFullscreen();
+    resize();
+  }
+
   function onFullscreenRefused() {
     fullscreenBlocked = true;
+    clearGateWait();
+    /* The button cannot work here, so stop pretending it can. */
+    if (gateMode) openGate('unsupported');
     syncFullscreen();
   }
 
@@ -347,6 +443,7 @@
     /* A hidden tab or a lost focus pauses instead of quietly eating lives. */
     document.addEventListener('visibilitychange', function () {
       if (document.hidden) pauseGame('hidden');
+      else audio.resumeContext();
     });
     global.addEventListener('blur', function () {
       if (performance.now() < suppressBlurUntil) return;
@@ -354,77 +451,82 @@
     });
 
     ['fullscreenchange', 'webkitfullscreenchange'].forEach(function (name) {
-      document.addEventListener(name, function () {
-        syncFullscreen();
-        resize();
-      });
+      document.addEventListener(name, onFullscreenChange);
     });
     global.addEventListener('pagehide', function () { pauseGame('hidden'); });
 
     var onResize = function () { resize(); syncFullscreen(); };
     global.addEventListener('resize', onResize);
     global.addEventListener('orientationchange', onResize);
-    if (global.ResizeObserver) {
-      new ResizeObserver(onResize).observe(ui.el.app);
-    }
+    if (global.ResizeObserver) new ResizeObserver(onResize).observe(ui.el.app);
   }
 
-  /* Prefer WebGL; fall back to Canvas 2D if a context cannot be created.
-   * Both renderers share the layout module and read the same effects state, so
+  /* Prefer WebGL; fall back to Canvas 2D if a context cannot be created. Both
+   * backends implement the same drawing interface and share src/scene.js, so
    * the two paths cannot drift apart visually. */
-  function createRenderer(loadedImages) {
+  function createRenderer() {
     /* ?renderer=2d forces the fallback, which makes it testable and gives a
      * way out if a device's WebGL driver misbehaves. */
     var forced = /[?&]renderer=2d\b/.test(global.location.search);
     try {
       if (forced) throw new Error('forced by ?renderer=2d');
-      return new CP.RendererGL(ui.el.playfield, CONFIG, loadedImages);
+      return new GG.RendererGL(ui.el.playfield, CONFIG, atlas);
     } catch (err) {
-      console.warn('COLOR PULSE: WebGL unavailable, falling back to Canvas 2D.', err && err.message);
+      console.warn('GALAXY GUNNER: WebGL unavailable, falling back to Canvas 2D.',
+                   err && err.message);
       /* A canvas is bound to the first context type it hands out, and the
-       * attempt above may already have taken a WebGL one — in which case
+       * attempt above may already have taken a WebGL one - in which case
        * getContext('2d') would return null. Swap in a clean element first.
        * Input listeners live on #app, not the canvas, so this is safe. */
       var stale = ui.el.playfield;
       var fresh = stale.cloneNode(false);
       stale.parentNode.replaceChild(fresh, stale);
       ui.el.playfield = fresh;
-      return new CP.Renderer2D(fresh, CONFIG, loadedImages);
+      return new GG.Renderer2D(fresh, CONFIG, atlas);
     }
   }
 
-  /* ---- start ------------------------------------------------------------ */
+  /* ---- start ---------------------------------------------------------------------- */
 
   function boot() {
     if (booted) return;
     booted = true;
 
-    ui = new CP.UI(CONFIG);
-    fx = new CP.Effects(CONFIG);
-    audio = new CP.AudioEngine(CONFIG);
+    ui = new GG.UI(CONFIG);
+    fx = new GG.Effects(CONFIG);
+    audio = new GG.AudioEngine(CONFIG);
+    quality = new GG.Quality(CONFIG);
+    scene = new GG.Scene(CONFIG);
 
-    game = new CP.Game(CONFIG, { onEvent: onGameEvent });
+    world = new GG.World(CONFIG, { onEvent: onWorldEvent, fx: fx, audio: audio });
 
-    input = new CP.InputController(ui.el.app, {
-      onStrike: onStrike,
+    input = new GG.InputController(ui.el.app, ui.el.playfield, {
       onPauseKey: togglePause,
+      onSkill: useBomb,
+      getLayout: function () { return renderer && renderer.layout; },
       onGesture: function () {
-        if (!audio.unlocked) audio.unlock();
+        if (!audio.unlocked) {
+          audio.unlock().then(function () { applySettings(); });
+        }
       }
     });
 
     Promise.resolve()
       .then(loadConfigOverrides)
-      .then(function () { return CP.assets.loadAll(); })
-      .then(function (loaded) {
-        images = loaded;
-        if (loaded.__missing && loaded.__missing.length) {
-          console.warn('COLOR PULSE: missing SVG assets', loaded.__missing);
-        }
-        renderer = createRenderer(images);
-        return audio.prefetch();
+      .then(function () {
+        if (CONFIG.debug.hitboxes === undefined) CONFIG.debug.hitboxes = false;
+        if (/[?&]debug\b/.test(global.location.search)) CONFIG.debug.hitboxes = true;
+        /* The atlas is painted here, once, before the first frame. */
+        atlas = GG.assets.build(CONFIG);
+        renderer = createRenderer();
+        /* Input listens on #app, but pointer coordinates are measured against
+         * the canvas, which createRenderer may have replaced. */
+        input.canvas = ui.el.playfield;
       })
       .then(function () {
+        quality.onChange(onQualityChange);
+        fx.applyQuality(quality.level);
+        scene.setQuality(quality.level);
         ui.syncSettingInputs();
         applySettings();
         wireControls();
@@ -436,26 +538,29 @@
         global.requestAnimationFrame(frame);
       })
       .catch(function (err) {
-        console.error('COLOR PULSE failed to start', err);
-        var loading = document.getElementById('screen-loading');
-        if (loading) loading.querySelector('.loading-text').textContent = 'Failed to load.';
+        console.error('GALAXY GUNNER failed to start', err);
+        var text = document.getElementById('loading-text');
+        if (text) text.textContent = 'Failed to load.';
       });
   }
 
   /* Exposed for the browser test hooks in tests/. */
-  global.COLOR_PULSE = {
-    get game() { return game; },
+  global.GALAXY_GUNNER = {
+    get world() { return world; },
     get ui() { return ui; },
     get fx() { return fx; },
     get audio() { return audio; },
     get renderer() { return renderer; },
-    startRun: function (options) { startRun(options || {}); },
+    get scene() { return scene; },
+    get quality() { return quality; },
+    get atlas() { return atlas; },
+    get input() { return input; },
+    startRun: startRun,
     pause: pauseGame,
     resume: resumeGame,
-    strike: function () { onStrike(performance.now()); },
-    /* Test hook: jump the count-up straight to a value. */
-    setDisplayScore: function (value) { displayScore = value; },
+    bomb: useBomb,
     get backend() { return renderer && renderer.backend; },
+    get drawCalls() { return renderer && renderer.drawCalls; },
     toggleFullscreen: toggleFullscreen,
     config: CONFIG
   };

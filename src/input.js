@@ -1,59 +1,125 @@
-/* Input handling. Registered exactly once at boot, so repeated restarts can
- * never multiply listeners.
+/* MobileInput - one drag, no joystick.
  *
- * Pointer Events only — no parallel touchstart + click pair, which is the
- * usual source of one tap scoring twice on a touchscreen.
+ * Registered exactly once at boot, so repeated restarts can never multiply
+ * listeners. Pointer Events only: no parallel touchstart + click pair, which
+ * is the usual source of a phone registering one gesture twice.
+ *
+ * Rules the brief is specific about, and how they are met here:
+ *   - drag anywhere in the lower 75% of the screen moves the ship      -> DRAG_ZONE
+ *   - the ship sits above the finger so it stays visible               -> config.player.fingerOffsetY
+ *   - multi-touch must not interrupt movement                          -> activeId, extra fingers ignored
+ *   - touchcancel must be handled                                      -> pointercancel releases cleanly
+ *   - the page must not scroll during play                             -> touch-action:none + preventDefault
+ *
+ * Releasing the finger does NOT recentre the ship: it holds station, because
+ * yanking the ship on release is how a player loses a run they had already
+ * dodged.
  */
 (function (global) {
   'use strict';
 
-  var ACTION_KEYS = { Space: 1, Enter: 1 };
+  var M = global.GG.math;
+  var Layout = global.GG.layout;
+
+  var DRAG_ZONE = 0.25;           /* top fraction of the screen that is inert */
+  var KEY_SPEED = 620;            /* world units / sec for keyboard steering */
+
+  var MOVE_KEYS = {
+    ArrowLeft: [-1, 0], KeyA: [-1, 0],
+    ArrowRight: [1, 0], KeyD: [1, 0],
+    ArrowUp: [0, -1], KeyW: [0, -1],
+    ArrowDown: [0, 1], KeyS: [0, 1]
+  };
   var PAUSE_KEYS = { Escape: 1, KeyP: 1 };
+  var SKILL_KEYS = { Space: 1, Enter: 1 };
 
-  /* A press is stamped with the time of the originating event when the
-   * browser reports it on the same clock as performance.now(); otherwise we
-   * fall back to now. Epoch-based timeStamps are rejected by the range test. */
-  function eventTime(event) {
-    var now = performance.now();
-    var ts = event && event.timeStamp;
-    if (typeof ts === 'number' && ts > 0 && ts <= now + 50) return ts;
-    return now;
-  }
-
-  function InputController(root, handlers) {
+  function InputController(root, canvas, handlers) {
     this.root = root;
+    this.canvas = canvas;
     this.handlers = handlers;
     this.enabled = false;
+    this.activeId = null;
+    this.keys = {};
+    this.pointer = null;          /* { x, y } in world units */
+    this.pointerIsMouse = false;
+    this.sample = { x: 0, y: 0, offsetY: 0 };
+    this.kb = null;               /* keyboard-steered point, world units */
+    this.lastSource = null;       /* 'pointer' | 'key' */
     this.bound = {};
     this.attach();
   }
 
-  /* Should this event strike the ring, or was it meant for a control? */
+  /* Is this event meant for the playfield, or for a button sitting over it? */
   InputController.prototype.isPlayfieldEvent = function (event) {
     var target = event.target;
     if (!target || !target.closest) return true;
-    if (target.closest('.no-strike')) return false;
+    if (target.closest('.no-drag')) return false;
     if (target.closest('.screen')) return false;
     return true;
+  };
+
+  InputController.prototype.toWorld = function (event, layout) {
+    var rect = this.canvas.getBoundingClientRect();
+    return Layout.toWorld(layout, event.clientX - rect.left, event.clientY - rect.top);
   };
 
   InputController.prototype.attach = function () {
     var self = this;
 
     this.bound.pointerdown = function (event) {
-      /* First gesture anywhere unlocks audio, including on menu buttons. */
+      /* the first gesture anywhere unlocks audio, menu buttons included */
       self.handlers.onGesture(event);
-
       if (!self.enabled) return;
-      if (event.pointerType === 'mouse' && event.button !== 0) return;  /* right/middle click */
-      if (event.isPrimary === false) return;                           /* extra fingers */
+      if (event.pointerType === 'mouse' && event.button !== 0) return;
       if (!self.isPlayfieldEvent(event)) return;
+
+      var layout = self.handlers.getLayout();
+      if (!layout) return;
+      var p = self.toWorld(event, layout);
+      /* Only the lower part of the screen starts a drag; the HUD strip is for
+       * reading, not steering. */
+      if (p.y < layout.worldH * DRAG_ZONE) return;
+
+      /* A second finger never steals control from the one already steering. */
+      if (self.activeId !== null) return;
+      self.activeId = event.pointerId;
+      self.pointer = p;
+      self.pointerIsMouse = event.pointerType === 'mouse';
+      self.lastSource = 'pointer';
       event.preventDefault();
-      self.handlers.onStrike(eventTime(event));
+      if (self.canvas.setPointerCapture) {
+        try { self.canvas.setPointerCapture(event.pointerId); } catch (e) {}
+      }
+    };
+
+    this.bound.pointermove = function (event) {
+      if (!self.enabled) return;
+      /* On desktop the ship follows the cursor whether or not a button is
+       * held - "mouse move OR click-drag" from the brief. On touch only the
+       * finger that started the drag steers. */
+      var isMouse = event.pointerType === 'mouse';
+      if (!isMouse && event.pointerId !== self.activeId) return;
+      if (isMouse && self.activeId === null && !self.isPlayfieldEvent(event)) return;
+
+      var layout = self.handlers.getLayout();
+      if (!layout) return;
+      var p = self.toWorld(event, layout);
+      if (isMouse && self.activeId === null && p.y < layout.worldH * DRAG_ZONE) return;
+
+      self.pointer = p;
+      self.pointerIsMouse = isMouse;
+      self.lastSource = 'pointer';
+      if (!isMouse) event.preventDefault();
+    };
+
+    /* pointerup, pointercancel and a lost capture all land here. */
+    this.bound.pointerend = function (event) {
+      if (event.pointerId !== self.activeId) return;
+      self.activeId = null;
+      /* self.pointer is deliberately kept: the ship holds its last position */
     };
 
     this.bound.keydown = function (event) {
-      if (event.repeat) return;                       /* key auto-repeat never autoplays */
       if (event.ctrlKey || event.metaKey || event.altKey) return;
 
       if (PAUSE_KEYS[event.code]) {
@@ -62,39 +128,119 @@
         return;
       }
 
-      if (!ACTION_KEYS[event.code]) return;
-
-      /* When a button or input has focus let the browser activate it instead;
-       * that is what Space and Enter mean there. */
       var active = document.activeElement;
-      if (active && (active.tagName === 'BUTTON' || active.tagName === 'INPUT' ||
-                     active.tagName === 'A' || active.isContentEditable)) {
+      var inWidget = active && (active.tagName === 'BUTTON' || active.tagName === 'INPUT' ||
+                                active.tagName === 'A' || active.isContentEditable);
+
+      if (SKILL_KEYS[event.code]) {
         self.handlers.onGesture(event);
+        if (inWidget || !self.enabled) return;   /* let Space activate a button */
+        event.preventDefault();
+        if (!event.repeat) self.handlers.onSkill();
         return;
       }
 
+      if (!MOVE_KEYS[event.code]) return;
       self.handlers.onGesture(event);
-      if (!self.enabled) return;
-      /* Only swallow the page scroll once we are actually consuming the key. */
+      if (!self.enabled || inWidget) return;
       event.preventDefault();
-      self.handlers.onStrike(eventTime(event));
+      self.keys[event.code] = true;
+      self.lastSource = 'key';
+    };
+
+    this.bound.keyup = function (event) {
+      if (MOVE_KEYS[event.code]) delete self.keys[event.code];
     };
 
     this.bound.contextmenu = function (event) {
       if (self.isPlayfieldEvent(event)) event.preventDefault();
     };
 
-    this.root.addEventListener('pointerdown', this.bound.pointerdown);
+    /* A dropped focus must not leave a key stuck down. */
+    this.bound.blur = function () {
+      self.keys = {};
+      self.activeId = null;
+    };
+
+    this.root.addEventListener('pointerdown', this.bound.pointerdown, { passive: false });
+    this.root.addEventListener('pointermove', this.bound.pointermove, { passive: false });
+    this.root.addEventListener('pointerup', this.bound.pointerend);
+    this.root.addEventListener('pointercancel', this.bound.pointerend);
+    this.root.addEventListener('lostpointercapture', this.bound.pointerend);
     this.root.addEventListener('contextmenu', this.bound.contextmenu);
     global.addEventListener('keydown', this.bound.keydown);
+    global.addEventListener('keyup', this.bound.keyup);
+    global.addEventListener('blur', this.bound.blur);
   };
 
-  /* Gameplay strikes are only accepted while the run is actually live. */
   InputController.prototype.setEnabled = function (enabled) {
     this.enabled = !!enabled;
+    if (!enabled) {
+      this.activeId = null;
+      this.keys = {};
+    }
   };
 
-  global.CP = global.CP || {};
-  global.CP.InputController = InputController;
-  global.CP.eventTime = eventTime;
+  /* Forget where the finger was, so a new run does not inherit the last one's
+   * steering target. */
+  InputController.prototype.reset = function () {
+    this.pointer = null;
+    this.pointerIsMouse = false;
+    this.sample = { x: 0, y: 0, offsetY: 0 };
+    this.kb = null;
+    this.activeId = null;
+    this.keys = {};
+    this.lastSource = null;
+  };
+
+  /* Called once per frame by the main loop. Returns the desired ship position
+   * in world units, plus how far above the contact point it should sit, or
+   * null when the player is not steering at all. */
+  InputController.prototype.read = function (player, layout, dt, fingerOffsetY) {
+    var dx = 0, dy = 0;
+    for (var code in this.keys) {
+      if (!this.keys[code]) continue;
+      var v = MOVE_KEYS[code];
+      dx += v[0];
+      dy += v[1];
+    }
+
+    /* One scratch object, reused every frame. This runs sixty times a second
+     * for the whole run, so returning a fresh literal would be the largest
+     * remaining source of steady garbage. */
+    var out = this.sample;
+
+    if (dx || dy) {
+      var len = Math.sqrt(dx * dx + dy * dy) || 1;
+      if (!this.kb) this.kb = { x: player.x, y: player.y };
+      var step = KEY_SPEED * (dt / 1000);
+      this.kb.x = M.clamp(this.kb.x + dx / len * step, 0, layout.worldW);
+      this.kb.y = M.clamp(this.kb.y + dy / len * step, 0, layout.worldH);
+      this.lastSource = 'key';
+      out.x = this.kb.x; out.y = this.kb.y; out.offsetY = 0;
+      return out;
+    }
+
+    /* Keyboard steering that has stopped still holds its last point, exactly
+     * like a lifted finger does. */
+    if (this.lastSource === 'key' && this.kb) {
+      out.x = this.kb.x; out.y = this.kb.y; out.offsetY = 0;
+      return out;
+    }
+
+    if (this.pointer) {
+      this.kb = null;
+      out.x = this.pointer.x;
+      out.y = this.pointer.y;
+      /* A cursor is not a fingertip: it does not cover the ship, so it gets no
+       * vertical offset. */
+      out.offsetY = this.pointerIsMouse ? 0 : fingerOffsetY;
+      return out;
+    }
+    return null;
+  };
+
+  global.GG = global.GG || {};
+  global.GG.InputController = InputController;
+  global.GG.DRAG_ZONE = DRAG_ZONE;
 })(window);

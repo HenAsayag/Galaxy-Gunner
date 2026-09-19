@@ -1,171 +1,112 @@
-/* Ring geometry and the single authoritative angle convention.
+/* Shared maths for the shooter: scalars, angles, easing and the Bezier
+ * evaluation that the enemy path library is built on.
  *
- * DESIGN ANGLES: 0 rad = twelve o'clock, positive = clockwise, radians.
- * This matches the SVG kit (ASSET_GUIDE.md) and is the only convention used
- * for gameplay state and collision. Canvas needs its own frame, so rendering
- * converts once, at the boundary, with toCanvasAngle().
- *
- * A sector occupies [start, start + span) in design angles. The marker sits at
- * angle 0 and never moves. A sector is "under the marker" when the clockwise
- * distance from its start to 0 is less than its span. Membership is inclusive
- * at the start edge and exclusive at the end edge, which makes two touching
- * sectors unambiguous.
+ * Pure functions only - no DOM, no canvas, no state - so the headless tests
+ * can require() this file directly.
  */
 (function (global) {
   'use strict';
 
   var TAU = Math.PI * 2;
 
-  /* Normalise any angle into [0, TAU). */
-  function norm(angle) {
-    var a = angle % TAU;
-    return a < 0 ? a + TAU : a;
-  }
+  function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+  function clamp01(v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+  function lerp(a, b, t) { return a + (b - a) * t; }
 
-  /* Clockwise distance from `from` to `to`, always in [0, TAU). */
-  function cwDelta(from, to) {
-    return norm(to - from);
-  }
-
-  /* Shortest signed distance from `from` to `to`, in (-PI, PI]. */
-  function shortestDelta(from, to) {
-    var d = norm(to - from);
-    return d > Math.PI ? d - TAU : d;
+  /* Frame-rate independent exponential approach. `tau` is the time in seconds
+   * to cover ~63% of the remaining distance; dt is in seconds. */
+  function approach(current, target, tau, dt) {
+    if (tau <= 0) return target;
+    return current + (target - current) * (1 - Math.exp(-dt / tau));
   }
 
   function degToRad(deg) { return deg * Math.PI / 180; }
-  function radToDeg(rad) { return rad * 180 / Math.PI; }
 
-  /* Design frame -> canvas frame. Canvas 0 rad points right and grows
-   * clockwise on screen (y axis points down), so top is -PI/2. */
-  function toCanvasAngle(designAngle) {
-    return designAngle - Math.PI / 2;
+  /* Shortest signed difference from a to b, in (-PI, PI]. */
+  function angleDelta(a, b) {
+    var d = (b - a) % TAU;
+    if (d > Math.PI) d -= TAU;
+    if (d < -Math.PI) d += TAU;
+    return d;
   }
 
-  /* Point on a circle for a design angle. */
-  function pointAt(cx, cy, radius, designAngle) {
-    return {
-      x: cx + radius * Math.sin(designAngle),
-      y: cy - radius * Math.cos(designAngle)
-    };
+  /* Rotate `from` toward `to` by at most `maxStep` radians. */
+  function turnToward(from, to, maxStep) {
+    var d = angleDelta(from, to);
+    if (d > maxStep) d = maxStep;
+    if (d < -maxStep) d = -maxStep;
+    return from + d;
   }
 
-  /* Does [start, start + span) contain `angle`? Wrap-safe for any input. */
-  function arcContains(start, span, angle) {
-    if (span <= 0) return false;
-    if (span >= TAU) return true;
-    return cwDelta(start, angle) < span;
+  function dist2(ax, ay, bx, by) {
+    var dx = bx - ax, dy = by - ay;
+    return dx * dx + dy * dy;
   }
 
-  /* Do [aStart, aStart + aSpan) and [bStart, bStart + bSpan) overlap? */
-  function arcsOverlap(aStart, aSpan, bStart, bSpan) {
-    if (aSpan <= 0 || bSpan <= 0) return false;
-    if (aSpan + bSpan >= TAU) return true;
-    return cwDelta(aStart, bStart) < aSpan || cwDelta(bStart, aStart) < bSpan;
+  /* Circle-circle overlap. Everything in the game collides as a circle: it is
+   * cheap, and it is the only shape that feels fair in a bullet hell. */
+  function circlesHit(ax, ay, ar, bx, by, br) {
+    var r = ar + br;
+    return dist2(ax, ay, bx, by) <= r * r;
   }
 
-  /* Free intervals on the circle once `blocked` ({start, span}) is removed.
-   * Returns a list of {start, span} in design angles; order is not meaningful,
-   * callers weight by span themselves.
-   *
-   * The blocked intervals may OVERLAP and may wrap past 0 — which is exactly
-   * what happens when sectors are padded by a minimum gap on both sides — so
-   * they have to be merged before the complement is taken. Treating them as
-   * disjoint produces phantom free space spanning other sectors.
-   */
-  function freeIntervals(blocked) {
-    var EPS = 1e-9;
+  /* ---- easing ----------------------------------------------------------- */
 
-    /* Cut every interval at the 0/TAU seam so they are all plain segments. */
-    var segments = [];
-    for (var i = 0; i < blocked.length; i++) {
-      var span = Math.min(Math.max(blocked[i].span, 0), TAU);
-      if (span <= EPS) continue;
-      var start = norm(blocked[i].start);
-      var end = start + span;
-      if (end <= TAU) {
-        segments.push([start, end]);
-      } else {
-        segments.push([start, TAU]);
-        segments.push([0, end - TAU]);
-      }
-    }
-    if (!segments.length) return [{ start: 0, span: TAU }];
-
-    segments.sort(function (a, b) { return a[0] - b[0]; });
-
-    var merged = [segments[0].slice()];
-    for (var j = 1; j < segments.length; j++) {
-      var last = merged[merged.length - 1];
-      if (segments[j][0] <= last[1] + EPS) {
-        if (segments[j][1] > last[1]) last[1] = segments[j][1];
-      } else {
-        merged.push(segments[j].slice());
-      }
-    }
-
-    var free = [];
-    var cursor = 0;
-    for (var k = 0; k < merged.length; k++) {
-      if (merged[k][0] - cursor > 1e-6) free.push([cursor, merged[k][0]]);
-      if (merged[k][1] > cursor) cursor = merged[k][1];
-    }
-    if (TAU - cursor > 1e-6) free.push([cursor, TAU]);
-
-    /* A free run touching both ends of the cut is really one wrapping run. */
-    if (free.length > 1 && free[0][0] <= EPS && free[free.length - 1][1] >= TAU - EPS) {
-      var head = free.shift();
-      var tail = free.pop();
-      free.push([tail[0], tail[1] + (head[1] - head[0])]);
-    }
-
-    return free.map(function (f) { return { start: norm(f[0]), span: f[1] - f[0] }; });
+  function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
+  function easeOutQuad(t) { return 1 - (1 - t) * (1 - t); }
+  function easeInQuad(t) { return t * t; }
+  function easeInOutSine(t) { return 0.5 - Math.cos(Math.PI * t) * 0.5; }
+  function easeOutBack(t) {
+    var c = 1.70158;
+    return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2);
   }
 
-  /* Intersect a free interval with an allowed band, both {start, span}. */
-  function intersectInterval(a, b) {
-    var out = [];
-    if (a.span <= 0 || b.span <= 0) return out;
-    if (a.span >= TAU) return [{ start: b.start, span: b.span }];
-    if (b.span >= TAU) return [{ start: a.start, span: a.span }];
-    /* Walk `a` and clip against `b`. */
-    var offset = cwDelta(b.start, a.start);
-    var startInB = offset < b.span;
-    var aEndOffset = offset + a.span;
-    if (startInB) {
-      var span = Math.min(a.span, b.span - offset);
-      if (span > 1e-6) out.push({ start: a.start, span: span });
-      /* `a` may re-enter `b` after wrapping all the way round. */
-      if (aEndOffset > TAU) {
-        var wrapped = Math.min(aEndOffset - TAU, b.span);
-        if (wrapped > 1e-6) out.push({ start: b.start, span: wrapped });
-      }
-    } else {
-      var toB = cwDelta(a.start, b.start);
-      if (toB < a.span) {
-        var span2 = Math.min(b.span, a.span - toB);
-        if (span2 > 1e-6) out.push({ start: b.start, span: span2 });
-      }
-    }
+  /* ---- Bezier ------------------------------------------------------------
+   * Enemy paths are cubic Beziers in normalised space (0..1 on both axes),
+   * scaled to the live playfield when the group spawns. `out` is reused by the
+   * caller so evaluating a path allocates nothing. */
+
+  function cubicAt(p0, p1, p2, p3, t) {
+    var mt = 1 - t;
+    var a = mt * mt * mt;
+    var b = 3 * mt * mt * t;
+    var c = 3 * mt * t * t;
+    var d = t * t * t;
+    return a * p0 + b * p1 + c * p2 + d * p3;
+  }
+
+  /* First derivative, used for heading. */
+  function cubicSlopeAt(p0, p1, p2, p3, t) {
+    var mt = 1 - t;
+    return 3 * mt * mt * (p1 - p0) + 6 * mt * t * (p2 - p1) + 3 * t * t * (p3 - p2);
+  }
+
+  /* `pts` is a flat [x0,y0, x1,y1, x2,y2, x3,y3, ...] chain where each further
+   * group of three points continues the curve. Returns position into `out`. */
+  function chainAt(pts, t, out) {
+    var segments = Math.max(1, (pts.length / 2 - 1) / 3);
+    var scaled = clamp01(t) * segments;
+    var index = Math.min(segments - 1, Math.floor(scaled));
+    var local = scaled - index;
+    var o = index * 6;                 /* 3 points * 2 coords per segment */
+    out.x = cubicAt(pts[o], pts[o + 2], pts[o + 4], pts[o + 6], local);
+    out.y = cubicAt(pts[o + 1], pts[o + 3], pts[o + 5], pts[o + 7], local);
+    out.dx = cubicSlopeAt(pts[o], pts[o + 2], pts[o + 4], pts[o + 6], local);
+    out.dy = cubicSlopeAt(pts[o + 1], pts[o + 3], pts[o + 5], pts[o + 7], local);
     return out;
   }
 
   var api = {
     TAU: TAU,
-    norm: norm,
-    cwDelta: cwDelta,
-    shortestDelta: shortestDelta,
-    degToRad: degToRad,
-    radToDeg: radToDeg,
-    toCanvasAngle: toCanvasAngle,
-    pointAt: pointAt,
-    arcContains: arcContains,
-    arcsOverlap: arcsOverlap,
-    freeIntervals: freeIntervals,
-    intersectInterval: intersectInterval
+    clamp: clamp, clamp01: clamp01, lerp: lerp, approach: approach,
+    degToRad: degToRad, angleDelta: angleDelta, turnToward: turnToward,
+    dist2: dist2, circlesHit: circlesHit,
+    easeOutCubic: easeOutCubic, easeOutQuad: easeOutQuad, easeInQuad: easeInQuad,
+    easeInOutSine: easeInOutSine, easeOutBack: easeOutBack,
+    cubicAt: cubicAt, cubicSlopeAt: cubicSlopeAt, chainAt: chainAt
   };
 
-  global.CP = global.CP || {};
-  global.CP.geometry = api;
+  global.GG = global.GG || {};
+  global.GG.math = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof window !== 'undefined' ? window : globalThis);

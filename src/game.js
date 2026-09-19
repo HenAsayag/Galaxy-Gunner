@@ -1,303 +1,685 @@
-/* Rules, scoring, lives and the gameplay state machine.
+/* The world: rules, entities, collisions and the gameplay state machine.
  *
- * No DOM, no canvas, no wall clock of its own: every entry point is handed a
- * timestamp, so tests can drive a whole run deterministically.
+ * No DOM and no wall clock of its own - every entry point is handed a
+ * timestamp, so a run can be driven deterministically from a test.
  *
  * Simulation clock
- *   `simTime` only advances while the run is actually live (playing, and the
- *   ring also turns during the resume countdown). Menus, pause, loading and a
- *   hidden tab therefore cannot consume the countdown timer or a life.
+ *   `simTime` only advances while the run is actually live. Menus, pause,
+ *   loading and a hidden tab therefore cannot spawn a wave or cost a life.
  *
- * Simultaneous timeout and press
- *   A press carries the timestamp of the originating input event. The caller
- *   advances the simulation to that instant first, so whichever event has the
- *   earlier simulation time resolves first. A timeout that falls strictly
- *   before the press is applied first (and may end the run, in which case the
- *   press is ignored); a press at or before the expiry resets the timer and
- *   the timeout never happens. Exactly one outcome per press, either way.
+ * Hit-stop
+ *   Big impacts freeze the simulation for a few milliseconds while the
+ *   renderer keeps drawing. It is consumed from the REAL delta before the
+ *   simulation delta is computed, so it cannot compound or be swallowed by a
+ *   slow frame.
+ *
+ * Stepping
+ *   The simulation advances in slices of at most MAX_STEP_MS. A long stall
+ *   (a backgrounded tab, a GC pause) is capped rather than replayed, so the
+ *   player never resumes into a screen of bullets that moved while they could
+ *   not see them.
  */
 (function (global) {
   'use strict';
 
-  var isNode = (typeof require === 'function' && typeof module !== 'undefined');
-  var G = isNode ? require('./geometry.js') : global.CP.geometry;
-  var RingMod = isNode ? require('./ring.js') : { Ring: global.CP.Ring };
-  var RngMod = isNode ? require('./rng.js') : { createRng: global.CP.createRng };
+  var M = global.GG.math;
+  var Pool = global.GG.Pool;
 
   var MAX_STEP_MS = 1000 / 60;
-  var MAX_CATCHUP_MS = 250;
+  var MAX_CATCHUP_MS = 200;
 
-  function Game(config, options) {
+  /* Enemy projectile families. Colour is the family, so the player learns the
+   * threat from the palette rather than from the shape alone. */
+  var BULLET_KINDS = {
+    orange:  { sprite: 'bullet_orange', r: 5.0, color: null, spin: false },
+    red:     { sprite: 'bullet_red',    r: 5.0, color: null, spin: false },
+    green:   { sprite: 'orb_green',     r: 6.5, color: null, spin: true },
+    blue:    { sprite: 'orb_blue',      r: 5.5, color: null, spin: true },
+    violet:  { sprite: 'orb_violet',    r: 6.5, color: null, spin: true },
+    missile: { sprite: 'missile',       r: 5.5, color: null, spin: false, trail: true }
+  };
+
+  function newBullet() {
+    return {
+      x: 0, y: 0, vx: 0, vy: 0, r: 4, angle: 0,
+      damage: 1, sprite: 'bolt_s', color: null, kind: '',
+      life: 4000, age: 0, pierce: 0, blast: 0,
+      homing: false, target: null, turnRate: 0, speed: 0, acquireMs: 0,
+      curve: 0, curveMs: 0, trail: false, trailTimer: 0, spin: 0
+    };
+  }
+
+  function World(config, options) {
     options = options || {};
     this.config = config;
     this.onEvent = options.onEvent || function () {};
-    this.rng = options.rng || RngMod.createRng(config.rules.seed);
-    this.ring = new RingMod.Ring(config, this.rng);
+    this.fx = options.fx;
+    this.audio = options.audio;
+    this.rng = options.rng || global.GG.createRng(0);
+
+    this.worldW = config.view.baseWidth;
+    this.worldH = config.view.designHeight;
+
+    this.player = new global.GG.Player(config);
+    this.weapons = new global.GG.Weapons(config);
+    this.enemies = new global.GG.Enemies(config, this);
+    this.boss = new global.GG.Boss(config, this);
+    this.pickups = new global.GG.Pickups(config, this);
+    this.director = new global.GG.Director(config, this);
+
+    this.playerBullets = new Pool(newBullet, null, config.bullets.maxPlayer);
+    this.enemyBullets = new Pool(newBullet, null, config.bullets.maxEnemy);
+
     this.state = 'idle';
-    this.practice = false;
     this.reset(0);
   }
 
-  Game.prototype.rules = function () { return this.config.rules; };
+  /* ---- lifecycle ---------------------------------------------------------- */
 
-  Game.prototype.reset = function (now) {
-    var rules = this.rules();
+  World.prototype.reset = function (now) {
     this.state = 'idle';
     this.simTime = 0;
-    this.visualTime = 0;   /* advances during countdown too; drives decorative motion */
     this.lastNow = now || 0;
-    this.ringAngle = 0;
-    this.direction = 1;   /* +1 clockwise, -1 anticlockwise */
-    this.ring.direction = 1;
     this.score = 0;
-    this.lives = rules.initialLives;
-    this.speed = rules.speedStartRadPerSec;
-    this.timerLeft = rules.timerSeconds * 1000;
-    this.countdownLeft = 0;
-    this.countdownShown = 0;
-    this.lastPressAt = -Infinity;
-    this.hits = 0;
-    this.misses = 0;
-    this.timeouts = 0;
-    this.hearts = 0;
-    this.gameOverEmitted = false;
-    this.ring.reset();
+    this.multiplier = 1;
+    this.multiplierMs = 0;
+    this.magnetMs = 0;
+    this.stageLabel = 'STAGE 1';
+    this.forceDrop = null;
+    this.kills = 0;
+    this.sinceDrop = 0;
+    this.shotsFired = 0;
+    this.bestCombo = 0;
+    this.combo = 0;
+    this.comboMs = 0;
+    this.pauseReason = null;
+
+    this.player.reset(this.worldW / 2, this.worldH * 0.78);
+    this.weapons.reset();
+    this.enemies.clear();
+    this.pickups.clear();
+    this.playerBullets.clear();
+    this.enemyBullets.clear();
+    this.boss.state = 'gone';
+    this.director.reset();
   };
 
-  /* Begin a fresh run. `seed` is optional and makes the layout reproducible. */
-  Game.prototype.start = function (now, options) {
+  World.prototype.setViewport = function (worldW, worldH) {
+    /* Keep the ship proportionally placed when the field resizes under it, so
+     * an orientation change or a collapsing address bar never drops the player
+     * onto a bullet. */
+    var fx = this.worldW ? this.player.x / this.worldW : 0.5;
+    var fy = this.worldH ? this.player.y / this.worldH : 0.8;
+    this.worldW = worldW;
+    this.worldH = worldH;
+    this.player.x = this.player.targetX = fx * worldW;
+    this.player.y = this.player.targetY = fy * worldH;
+    this.player.prevX = this.player.x;
+  };
+
+  World.prototype.start = function (now, options) {
     options = options || {};
-    if (options.seed !== undefined) this.rng = RngMod.createRng(options.seed);
-    this.ring = new RingMod.Ring(this.config, this.rng);
     this.reset(now);
-    this.practice = !!options.practice;
-    this.seed = this.rng.seed;
-    this.beginCountdown(now, 'start');
-  };
-
-  Game.prototype.beginCountdown = function (now, reason) {
-    this.state = 'countdown';
+    this.rng = global.GG.createRng(options.seed === undefined ? Date.now() : options.seed);
+    this.state = 'playing';
     this.lastNow = now;
-    this.countdownLeft = this.rules().countdownSeconds * 1000;
-    this.countdownShown = 0;
-    this.emit('countdown-start', { reason: reason, seconds: this.rules().countdownSeconds });
+    this.player.enter(this.worldW, this.worldH);
+    this.director.startStage(0);
+    this.onEvent('start', {});
   };
 
-  Game.prototype.emit = function (type, payload) {
-    this.onEvent(type, payload || {});
-  };
+  World.prototype.isLive = function () { return this.state === 'playing'; };
 
-  Game.prototype.isLive = function () {
-    return this.state === 'playing' || this.state === 'countdown';
-  };
-
-  /* Advance the simulation to `now`. Safe to call repeatedly and from input
-   * handlers; never steps backwards. */
-  Game.prototype.advanceTo = function (now) {
-    if (!this.isLive()) { this.lastNow = now; return; }
-    var dt = now - this.lastNow;
-    if (!(dt > 0)) { this.lastNow = Math.max(this.lastNow, now); return; }
-    this.lastNow = now;
-    /* A suspended tab can hand back a huge delta; clamp instead of teleporting
-     * the ring (and never bank up timer penalties that the player never saw). */
-    if (dt > MAX_CATCHUP_MS) dt = MAX_CATCHUP_MS;
-
-    var remaining = dt;
-    while (remaining > 0 && this.isLive()) {
-      var step = Math.min(remaining, MAX_STEP_MS);
-      if (this.state === 'countdown') this.stepCountdown(step);
-      else this.stepPlaying(step);
-      remaining -= step;
-    }
-  };
-
-  Game.prototype.stepCountdown = function (dt) {
-    this.advanceRing(dt);
-    this.countdownLeft -= dt;
-    var showing = Math.max(0, Math.ceil(this.countdownLeft / 1000));
-    if (showing !== this.countdownShown && showing > 0) {
-      this.countdownShown = showing;
-      this.emit('countdown-tick', { value: showing });
-    }
-    if (this.countdownLeft <= 0) {
-      this.state = 'playing';
-      this.timerLeft = this.rules().timerSeconds * 1000;
-      this.emit('countdown-end', {});
-      this.emit('state', { state: 'playing' });
-    }
-  };
-
-  Game.prototype.stepPlaying = function (dt) {
-    this.simTime += dt;
-    this.advanceRing(dt);
-    if (this.rules().timerMode === 'countdown') {
-      this.timerLeft -= dt;
-      if (this.timerLeft <= 0) this.onTimeout();
-    }
-  };
-
-  Game.prototype.advanceRing = function (dt) {
-    var rules = this.rules();
-    this.visualTime += dt;
-    var target = Math.min(rules.speedMaxRadPerSec,
-                          rules.speedStartRadPerSec + rules.speedPerPoint * this.score);
-    /* Exponential ease so a score jump never steps the rotation visibly. */
-    var k = rules.speedRampMs > 0 ? 1 - Math.exp(-dt / rules.speedRampMs) : 1;
-    this.speed += (target - this.speed) * k;
-    this.ring.speed = this.speed;
-    this.ringAngle = G.norm(this.ringAngle + this.direction * this.speed * dt / 1000);
-    this.ring.update(dt, this.ringAngle);
-  };
-
-  Game.prototype.resetTimer = function () {
-    this.timerLeft = this.rules().timerSeconds * 1000;
-  };
-
-  Game.prototype.timerFraction = function () {
-    var total = this.rules().timerSeconds * 1000;
-    if (total <= 0) return 1;
-    return Math.max(0, Math.min(1, this.timerLeft / total));
-  };
-
-  /* One physical press -> exactly one outcome. */
-  Game.prototype.press = function (atTime) {
-    if (this.state !== 'playing') return { type: 'ignored' };
-    if (atTime - this.lastPressAt < this.rules().inputCooldownMs) {
-      return { type: 'duplicate' };
-    }
-    this.lastPressAt = atTime;
-
-    /* Judge against the angle the player actually saw, then reverse, and only
-     * then award: replacement sectors are placed by award() and must use the
-     * NEW direction, or they would spawn behind the marker. */
-    var sector = this.ring.hitTest(this.ringAngle);
-    if (this.rules().reverseOnPress) this.reverse();
-    var result = sector ? this.award(sector) : this.fail('gap');
-    /* Reshape last, so the replacement spawned by award() is included. */
-    if (this.rules().resizeOnPress) this.ring.resizeAll(this.ringAngle);
-    return result;
-  };
-
-  /* Every press flips which way the ring turns. Only the sign changes; the
-   * speed magnitude keeps its eased ramp, so there is no jolt. */
-  Game.prototype.reverse = function () {
-    this.direction = -this.direction;
-    this.ring.direction = this.direction;
-    this.emit('reverse', { direction: this.direction });
-  };
-
-  Game.prototype.award = function (sector) {
-    var rules = this.rules();
-    var healed = false;
-    this.score += sector.points;
-    this.hits++;
-
-    if (sector.heals) {
-      this.hearts++;
-      if (this.lives < rules.maxLives) {
-        this.lives = Math.min(rules.maxLives, this.lives + sector.heals);
-        healed = true;
-      }
-    }
-
-    var absStart = this.ring.absoluteStart(sector, this.ringAngle);
-    this.ring.consume(sector, this.ringAngle);
-    this.resetTimer();
-
-    /* Only a normal hit can roll a new collectible, so collecting the orange
-     * cannot immediately conjure another one. */
-    if (!sector.heals) this.ring.maybeSpawnHeart(this.ringAngle);
-
-    var result = {
-      type: sector.heals ? 'heal' : 'hit',
-      sector: sector.id,
-      color: sector.color,
-      points: sector.points,
-      healed: healed,
-      lives: this.lives,
-      score: this.score,
-      angle: absStart + sector.span / 2
-    };
-    this.emit(result.type, result);
-    return result;
-  };
-
-  Game.prototype.fail = function (cause) {
-    var rules = this.rules();
-    var cost = cause === 'timeout' ? rules.timeoutCosts : rules.emptyTapCosts;
-    if (cause === 'timeout') this.timeouts++; else this.misses++;
-
-    if (!this.practice) {
-      this.lives = Math.max(0, this.lives - cost);
-      if (rules.missScorePenalty) {
-        this.score = Math.max(0, this.score - rules.missScorePenalty);
-      }
-    }
-    this.resetTimer();
-
-    var result = { type: 'miss', cause: cause, lives: this.lives, score: this.score };
-    this.emit('miss', result);
-
-    if (this.lives <= 0 && !this.practice) this.endRun();
-    return result;
-  };
-
-  Game.prototype.onTimeout = function () {
-    /* Fold any overshoot back in so a long frame cannot charge two timeouts. */
-    this.fail('timeout');
-  };
-
-  Game.prototype.endRun = function () {
-    if (this.gameOverEmitted) return;
-    this.gameOverEmitted = true;
-    this.state = 'gameover';
-    this.emit('gameover', {
-      score: this.score,
-      hits: this.hits,
-      misses: this.misses,
-      timeouts: this.timeouts,
-      hearts: this.hearts
-    });
-    this.emit('state', { state: 'gameover' });
-  };
-
-  Game.prototype.pause = function (now, reason) {
-    if (!this.isLive()) return false;
+  World.prototype.pause = function (now, reason) {
+    if (this.state !== 'playing') return false;
     this.advanceTo(now);
-    if (!this.isLive()) return false;   /* the catch-up may have ended the run */
-    this.resumeInto = this.state;
     this.state = 'paused';
-    this.emit('state', { state: 'paused', reason: reason || 'manual' });
+    this.pauseReason = reason || 'manual';
     return true;
   };
 
-  Game.prototype.resume = function (now) {
+  World.prototype.resume = function (now) {
     if (this.state !== 'paused') return false;
+    this.state = 'playing';
     this.lastNow = now;
-    /* Always come back through the 3-2-1 countdown; input stays locked out
-     * until it finishes, so nobody is punished for a surprise resume. */
-    this.beginCountdown(now, 'resume');
+    /* A resume must never cost a life to something that was already on top of
+     * the ship while the game was frozen. */
+    this.player.invulnMs = Math.max(this.player.invulnMs, 900);
     return true;
   };
 
-  Game.prototype.snapshot = function () {
+  /* ---- clock --------------------------------------------------------------- */
+
+  World.prototype.advanceTo = function (now) {
+    if (this.state !== 'playing') { this.lastNow = now; return 0; }
+    var elapsed = now - this.lastNow;
+    this.lastNow = now;
+    if (!(elapsed > 0)) return 0;
+
+    /* hit-stop eats real time before the simulation sees any of it */
+    var frozen = this.fx ? this.fx.consumeHitStop(elapsed) : 0;
+    elapsed -= frozen;
+    if (elapsed <= 0) return 0;
+
+    if (elapsed > MAX_CATCHUP_MS) elapsed = MAX_CATCHUP_MS;
+
+    var remaining = elapsed;
+    while (remaining > 0) {
+      var step = Math.min(MAX_STEP_MS, remaining);
+      this.step(step);
+      remaining -= step;
+      if (this.state !== 'playing') break;
+    }
+    return elapsed;
+  };
+
+  World.prototype.step = function (dt) {
+    this.simTime += dt;
+
+    this.multiplierMs = Math.max(0, this.multiplierMs - dt);
+    if (this.multiplierMs <= 0) this.multiplier = 1;
+    this.magnetMs = Math.max(0, this.magnetMs - dt);
+
+    this.comboMs = Math.max(0, this.comboMs - dt);
+    if (this.comboMs <= 0) this.combo = 0;
+
+    this.director.update(dt);
+    this.player.update(dt, this.input, this.worldW, this.worldH);
+    this.weapons.update(dt, this, this.player);
+    this.enemies.update(dt);
+    this.boss.update(dt);
+    this.pickups.update(dt, this.player, this.magnetMs > 0);
+
+    this.updateBullets(this.playerBullets, dt, true);
+    this.updateBullets(this.enemyBullets, dt, false);
+
+    this.collide();
+  };
+
+  /* ---- projectiles ---------------------------------------------------------- */
+
+  World.prototype.spawnPlayerBullet = function (x, y, vx, vy, sprite, damage, opts) {
+    var b = this.playerBullets.obtain();
+    if (!b) return null;
+    opts = opts || {};
+    b.x = x; b.y = y; b.vx = vx; b.vy = vy;
+    b.angle = Math.atan2(vx, -vy);
+    b.damage = damage;
+    b.sprite = sprite;
+    b.color = opts.color || null;
+    b.kind = 'player';
+    b.r = opts.r || 6;
+    b.life = 2600; b.age = 0;
+    b.pierce = opts.pierce || 0;
+    b.blast = opts.blast || 0;
+    b.homing = false; b.target = null; b.curve = 0; b.curveMs = 0;
+    b.trail = false; b.trailTimer = 0; b.spin = 0;
+    this.shotsFired++;
+    return b;
+  };
+
+  World.prototype.spawnMissile = function (x, y, vx, vy, damage, mod) {
+    var b = this.playerBullets.obtain();
+    if (!b) return null;
+    b.x = x; b.y = y; b.vx = vx; b.vy = vy;
+    b.angle = Math.atan2(vx, -vy);
+    b.damage = damage;
+    b.sprite = mod.sprite || 'missile';
+    b.color = null;
+    b.kind = 'player';
+    b.r = 7;
+    b.life = 3200; b.age = 0;
+    b.pierce = 0;
+    b.blast = mod.blast || 30;
+    b.homing = true;
+    b.target = null;
+    /* Delayed acquisition plus a turn-rate cap is what makes a missile trace a
+     * long curve instead of snapping onto its target. */
+    b.acquireMs = mod.acquireMs || 190;
+    b.turnRate = mod.turnRate || 4.4;
+    b.speed = mod.speed || 520;
+    b.curve = 0; b.curveMs = 0;
+    b.trail = true; b.trailTimer = 0; b.spin = 0;
+    this.shotsFired++;
+    return b;
+  };
+
+  World.prototype.spawnEnemyBullet = function (x, y, vx, vy, kind) {
+    var def = BULLET_KINDS[kind] || BULLET_KINDS.orange;
+    var b = this.enemyBullets.obtain();
+    if (!b) return null;
+    b.x = x; b.y = y; b.vx = vx; b.vy = vy;
+    b.angle = Math.atan2(vx, vy) + Math.PI;
+    b.damage = 1;
+    b.sprite = def.sprite;
+    b.color = null;
+    b.kind = kind;
+    b.r = def.r;
+    b.life = 6000; b.age = 0;
+    b.pierce = 0; b.blast = 0;
+    b.homing = false; b.target = null; b.turnRate = 0; b.speed = 0;
+    b.curve = 0; b.curveMs = 0;
+    b.trail = !!def.trail; b.trailTimer = 0;
+    b.spin = def.spin ? (this.rng() - 0.5) * 6 : 0;
+    return b;
+  };
+
+  World.prototype.updateBullets = function (pool, dt, isPlayer) {
+    var s = dt / 1000;
+    var W = this.worldW, H = this.worldH;
+    var pad = 60;
+
+    for (var i = pool.live - 1; i >= 0; i--) {
+      var b = pool.at(i);
+      b.age += dt;
+
+      if (b.homing) {
+        if (b.acquireMs > 0) {
+          b.acquireMs -= dt;
+        } else {
+          /* retarget when the previous target died, which is what keeps a
+           * volley useful through a collapsing formation */
+          if (!b.target || b.target.dead || b.target.hp <= 0) {
+            b.target = isPlayer
+              ? (this.boss.active() && this.rng() < 0.35
+                  ? this.boss
+                  : this.enemies.nearest(b.x, b.y, 460, null))
+              : this.player;
+          }
+          if (b.target) {
+            var want = Math.atan2(b.target.x - b.x, -(b.target.y - b.y));
+            var cur = Math.atan2(b.vx, -b.vy);
+            var next = M.turnToward(cur, want, b.turnRate * s);
+            b.vx = Math.sin(next) * b.speed;
+            b.vy = -Math.cos(next) * b.speed;
+          }
+        }
+      } else if (b.curveMs > 0) {
+        /* a fixed-rate bend for the non-homing curved pairs */
+        b.curveMs -= dt;
+        var a = Math.atan2(b.vx, b.vy) + b.curve * s;
+        var sp = Math.sqrt(b.vx * b.vx + b.vy * b.vy);
+        b.vx = Math.sin(a) * sp;
+        b.vy = Math.cos(a) * sp;
+      }
+
+      b.x += b.vx * s;
+      b.y += b.vy * s;
+      b.angle = isPlayer ? Math.atan2(b.vx, -b.vy) : Math.atan2(b.vx, b.vy) + Math.PI;
+      if (b.spin) b.angle += b.spin * (b.age / 1000);
+
+      /* Trail samples are emitted on a fixed clock and left behind in world
+       * space, which is what draws the long curve a homing missile carves.
+       * The spacing is tight enough that consecutive samples overlap, so it
+       * reads as a ribbon rather than a dotted line. */
+      if (b.trail && this.fx) {
+        b.trailTimer -= dt;
+        if (b.trailTimer <= 0) {
+          b.trailTimer = 11;
+          var warm = isPlayer ? this.config.palette.missile
+                              : this.config.palette.enemyBoltHot;
+          this.fx.trail('glow', b.x, b.y, {
+            life: 320, s0: 0.38, s1: 0.04, color: warm, a0: 0.55
+          });
+          this.fx.trail('glow', b.x, b.y, {
+            life: 150, s0: 0.16, s1: 0.02, color: '#ffffff', a0: 0.8
+          });
+        }
+      }
+
+      if (b.age > b.life || b.x < -pad || b.x > W + pad || b.y < -pad || b.y > H + pad) {
+        pool.releaseAt(i);
+      }
+    }
+  };
+
+  /* ---- instant-hit weapons ---------------------------------------------------
+   * A beam is resolved as a vertical slab test rather than drawn as a
+   * projectile: it lands on the frame it fires, which is what makes a laser
+   * feel like a laser. */
+  World.prototype.beamDamage = function (x, width, damage, color) {
+    var half = width / 2;
+    var top = this.player.y;
+    var hitAny = false;
+
+    for (var i = this.enemies.pool.live - 1; i >= 0; i--) {
+      var e = this.enemies.pool.at(i);
+      if (e.delayMs > 0 || e.y > top) continue;
+      if (Math.abs(e.x - x) > half + e.r) continue;
+      hitAny = true;
+      this.fx.hitFlash(e.x, e.y + e.r * 0.4, color, 1.1);
+      if (this.enemies.hit(e, damage)) {
+        this.killEnemy(e, i);
+      }
+    }
+
+    if (this.boss.active() && Math.abs(this.boss.x - x) < half + this.boss.r &&
+        this.boss.y < top) {
+      hitAny = true;
+      this.fx.hitFlash(this.boss.x, this.boss.y + this.boss.r * 0.5, color, 1.4);
+      this.damageBoss(damage);
+    }
+    return hitAny;
+  };
+
+  /* The boss's moving laser columns, resolved the same way against the ship. */
+  World.prototype.bossLaser = function (x, width, damage, color, fromY) {
+    var p = this.player;
+    if (!p.vulnerable()) return;
+    if (p.y < fromY) return;
+    if (Math.abs(p.x - x) > width / 2 + p.hitRadius) return;
+    this.hurtPlayer();
+  };
+
+  World.prototype.chainLightning = function (x, y, jumps, range, damage) {
+    var from = { x: x, y: y };
+    var previous = null;
+    var P = this.config.palette;
+    for (var j = 0; j < jumps; j++) {
+      var target = this.enemies.nearest(from.x, from.y, range, previous);
+      if (!target) break;
+      /* the arc itself is a line of pooled sparks, so it costs no geometry */
+      var steps = 6;
+      for (var k = 0; k <= steps; k++) {
+        var t = k / steps;
+        this.fx.trail('spark',
+          M.lerp(from.x, target.x, t) + (this.rng() - 0.5) * 14,
+          M.lerp(from.y, target.y, t) + (this.rng() - 0.5) * 14,
+          { life: 150, s0: 0.34, s1: 0.02, color: P.laser, a0: 0.9 });
+      }
+      this.fx.hitFlash(target.x, target.y, P.laser, 1.2);
+      var index = this.indexOfEnemy(target);
+      if (this.enemies.hit(target, damage) && index >= 0) this.killEnemy(target, index);
+      previous = target;
+      from = target;
+      damage *= 0.7;
+    }
+  };
+
+  World.prototype.indexOfEnemy = function (enemy) {
+    for (var i = 0; i < this.enemies.pool.live; i++) {
+      if (this.enemies.pool.at(i) === enemy) return i;
+    }
+    return -1;
+  };
+
+  /* ---- collisions -------------------------------------------------------------
+   * Everything is a circle. The player's circle is the cockpit, not the
+   * wingspan, which is the single most important fairness decision in the
+   * genre. */
+  World.prototype.collide = function () {
+    var i, j, b, e;
+
+    /* player shots -> enemies and boss */
+    for (i = this.playerBullets.live - 1; i >= 0; i--) {
+      b = this.playerBullets.at(i);
+      var consumed = false;
+
+      for (j = this.enemies.pool.live - 1; j >= 0; j--) {
+        e = this.enemies.pool.at(j);
+        if (e.delayMs > 0) continue;
+        if (!M.circlesHit(b.x, b.y, b.r, e.x, e.y, e.r)) continue;
+
+        this.fx.hitFlash(b.x, b.y, this.config.palette.playerBoltHot, 1);
+        if (b.blast) this.splash(b.x, b.y, b.blast, b.damage * 0.6, e);
+        if (this.enemies.hit(e, b.damage)) this.killEnemy(e, j);
+
+        if (b.blast) {
+          this.fx.explosion(b.x, b.y, 0.8, 'normal');
+          this.audio.play('missile_hit');
+        }
+        if (b.pierce > 0) { b.pierce--; } else { consumed = true; }
+        break;
+      }
+
+      if (!consumed && this.boss.active() &&
+          M.circlesHit(b.x, b.y, b.r, this.boss.x, this.boss.y, this.boss.r)) {
+        this.fx.hitFlash(b.x, b.y, this.config.palette.playerBoltHot, 1.2);
+        if (b.blast) this.fx.explosion(b.x, b.y, 0.9, 'normal');
+        this.damageBoss(b.damage);
+        if (b.pierce > 0) b.pierce--; else consumed = true;
+      }
+
+      if (consumed) this.playerBullets.releaseAt(i);
+    }
+
+    /* enemy shots -> player */
+    if (this.player.vulnerable()) {
+      for (i = this.enemyBullets.live - 1; i >= 0; i--) {
+        b = this.enemyBullets.at(i);
+        if (!M.circlesHit(b.x, b.y, b.r, this.player.x, this.player.y, this.player.hitRadius)) continue;
+        this.enemyBullets.releaseAt(i);
+        this.hurtPlayer();
+        break;                            /* one hit per frame, never a chain */
+      }
+    }
+
+    /* ramming */
+    if (this.player.vulnerable()) {
+      for (j = this.enemies.pool.live - 1; j >= 0; j--) {
+        e = this.enemies.pool.at(j);
+        if (e.delayMs > 0) continue;
+        if (!M.circlesHit(e.x, e.y, e.r * 0.8, this.player.x, this.player.y, this.player.hitRadius)) continue;
+        if (!e.elite && !e.heavy) {
+          if (this.enemies.hit(e, 999)) this.killEnemy(e, j);
+        }
+        this.hurtPlayer();
+        break;
+      }
+    }
+  };
+
+  /* Area damage around a missile or plasma impact. */
+  World.prototype.splash = function (x, y, radius, damage, exclude) {
+    for (var i = this.enemies.pool.live - 1; i >= 0; i--) {
+      var e = this.enemies.pool.at(i);
+      if (e === exclude || e.delayMs > 0) continue;
+      if (M.dist2(x, y, e.x, e.y) > radius * radius) continue;
+      if (this.enemies.hit(e, damage)) this.killEnemy(e, i);
+    }
+  };
+
+  /* ---- outcomes ---------------------------------------------------------------- */
+
+  World.prototype.killEnemy = function (e, index) {
+    var F = this.config.feel;
+    var scale = e.elite ? 2.1 : e.heavy ? 1.5 : 1;
+    var kind = e.elite ? 'elite' : e.heavy ? 'heavy' : 'normal';
+
+    this.fx.explosion(e.x, e.y, scale, kind);
+    this.fx.shake(e.elite ? F.shake.elite : e.heavy ? F.shake.heavy : F.shake.kill);
+    this.fx.hitStop(e.elite ? F.hitStop.elite : e.heavy ? F.hitStop.heavy : F.hitStop.normal);
+    this.audio.play(e.heavy ? 'boom_l' : 'boom_s');
+
+    this.combo++;
+    this.comboMs = 2200;
+    if (this.combo > this.bestCombo) this.bestCombo = this.combo;
+    this.kills++;
+
+    var points = Math.round(e.score * this.multiplier * (1 + Math.min(this.combo, 30) * 0.012));
+    this.score += points;
+    this.fx.popup('+' + points, e.x, e.y, e.elite ? this.config.palette.gold : this.config.palette.white);
+
+    this.maybeDrop(e);
+    this.enemies.pool.releaseAt(index);
+    this.onEvent('kill', { x: e.x, y: e.y, elite: e.elite, score: points });
+  };
+
+  World.prototype.maybeDrop = function (e) {
+    if (this.forceDrop) {
+      this.pickups.spawn(e.x, e.y, this.forceDrop);
+      this.forceDrop = null;
+      this.sinceDrop = 0;
+      return;
+    }
+    this.sinceDrop++;
+    /* Pity timer: a long unlucky streak would leave the player stuck on tier
+     * one through a whole stage, which is the one outcome the pacing cannot
+     * afford. */
+    var forced = this.sinceDrop >= this.config.pickups.pityKills;
+    if (!forced && this.rng() >= e.def.drop) return;
+    this.sinceDrop = 0;
+    this.pickups.spawn(e.x, e.y, this.pickups.roll({
+      tier: this.weapons.tier,
+      shield: this.player.shield,
+      bombs: this.player.bombs
+    }));
+  };
+
+  World.prototype.damageBoss = function (damage) {
+    if (this.boss.hit(damage)) {
+      this.score += Math.round(5000 * this.multiplier);
+      this.onEvent('boss-down', {});
+    }
+  };
+
+  World.prototype.onBossPhase = function (boss) {
+    this.fx.hitStop(this.config.feel.hitStop.bossPhase);
+    this.fx.shake(this.config.feel.shake.boss);
+    this.fx.flash(boss.accent, 0.45);
+    this.fx.banner('CORE EXPOSED', boss.accent, 900);
+    this.audio.play('boom_l');
+  };
+
+  World.prototype.onBossDestroyed = function () {
+    this.score += Math.round(10000 * this.multiplier);
+    /* A boss always leaves something behind; the run has to keep escalating. */
+    this.pickups.spawn(this.worldW / 2 - 40, this.worldH * 0.35, 'weapon');
+    this.pickups.spawn(this.worldW / 2 + 40, this.worldH * 0.35, 'missile');
+  };
+
+  World.prototype.spawnBossAdds = function (x) {
+    this.enemies.spawnGroup({
+      type: 'scoutB', count: 4, path: 'snake', durationMs: 5200,
+      staggerMs: 170, offsetX: (x / this.worldW) - 0.5, phaseStep: 0.8
+    });
+  };
+
+  World.prototype.hurtPlayer = function () {
+    var F = this.config.feel;
+    var result = this.player.damage();
+    if (result === 'none') return;
+
+    this.combo = 0;
+    this.multiplier = 1;
+    this.multiplierMs = 0;
+
+    if (result === 'shield') {
+      this.fx.particle('shield_ring', this.player.x, this.player.y, {
+        life: 320, s0: 0.5, s1: 1.0, color: this.config.palette.shield, a0: 0.95, a1: 0, drag: 1
+      });
+      this.fx.shake(2.5);
+      this.fx.flash(this.config.palette.shield, 0.3);
+      this.audio.play('shield_hit');
+      this.onEvent('shield', {});
+      return;
+    }
+
+    this.fx.flash('#ffffff', 0.55);
+    this.fx.shake(F.shake.playerHit);
+    this.fx.hitStop(F.hitStop.playerHit);
+    this.fx.explosion(this.player.x, this.player.y, 1.6, 'heavy');
+    this.audio.play('player_hit');
+
+    /* Losing a life costs a weapon tier, which is the pressure that makes the
+     * upgrade pickups matter. */
+    if (this.weapons.tier > 1) this.weapons.tier--;
+
+    if (result === 'dead') {
+      this.endRun();
+    } else {
+      this.onEvent('hurt', { lives: this.player.lives });
+    }
+  };
+
+  World.prototype.useBomb = function () {
+    if (!this.player.active() || this.player.bombs <= 0) return false;
+    this.player.bombs--;
+
+    this.enemyBullets.clear();
+    this.fx.flash('#ffffff', 0.85);
+    this.fx.shockwave(this.player.x, this.player.y, 6);
+    this.fx.shake(this.config.feel.shake.bomb);
+    this.fx.hitStop(40);
+    this.audio.play('bomb');
+
+    for (var i = this.enemies.pool.live - 1; i >= 0; i--) {
+      var e = this.enemies.pool.at(i);
+      if (e.delayMs > 0) continue;
+      if (this.enemies.hit(e, 14)) this.killEnemy(e, i);
+    }
+    if (this.boss.active()) this.damageBoss(60);
+    this.onEvent('bomb', { bombs: this.player.bombs });
+    return true;
+  };
+
+  /* ---- pickups --------------------------------------------------------------- */
+
+  World.prototype.collect = function (p) {
+    var cfg = this.config.pickups;
+    var P = this.config.palette;
+    var label = null;
+
+    this.fx.pickupBurst(p.x, p.y, p.color);
+    this.fx.hudPulse(p.color);
+    this.audio.play(p.kind === 'weapon' || p.kind === 'missile' ? 'upgrade' : 'pickup');
+
+    switch (p.kind) {
+      case 'weapon':
+        label = this.weapons.upgradeMain();
+        if (!label) { this.score += 1500; label = 'WEAPON MAX  +1500'; }
+        break;
+      case 'missile':
+        label = this.weapons.upgradeModule();
+        if (!label) { this.score += 1200; label = 'MODULES MAX  +1200'; }
+        break;
+      case 'shield':
+        this.player.shield = Math.min(3, this.player.shield + 1);
+        label = 'SHIELD UP';
+        break;
+      case 'rapid':
+        this.weapons.setRapid(cfg.rapidMs);
+        label = 'RAPID FIRE';
+        break;
+      case 'multi':
+        this.multiplier = 2;
+        this.multiplierMs = cfg.multiplierMs;
+        label = 'SCORE x2';
+        break;
+      case 'magnet':
+        this.magnetMs = cfg.magnetMs;
+        label = 'MAGNET';
+        break;
+      case 'bomb':
+        this.player.addBomb();
+        label = 'BOMB +1';
+        break;
+    }
+
+    /* The message appears over live combat and never pauses it. */
+    if (label) this.fx.banner(label, p.kind === 'weapon' ? P.plasma : p.color, cfg.bannerMs);
+    this.onEvent('pickup', { kind: p.kind, label: label });
+  };
+
+  /* ---- end ------------------------------------------------------------------- */
+
+  World.prototype.endRun = function () {
+    this.state = 'gameover';
+    this.onEvent('gameover', this.stats());
+  };
+
+  World.prototype.stats = function () {
     return {
-      state: this.state,
-      simTime: this.visualTime,
       score: this.score,
-      lives: this.lives,
-      maxLives: this.rules().maxLives,
-      ringAngle: this.ringAngle,
-      speed: this.speed,
-      timerFraction: this.timerFraction(),
-      countdownValue: Math.max(0, Math.ceil(this.countdownLeft / 1000)),
-      practice: this.practice,
-      sectors: this.ring.snapshot(this.ringAngle)
+      stage: this.director.stage + 1,
+      kills: this.kills,
+      combo: this.bestCombo,
+      tier: this.weapons.tier,
+      timeMs: Math.round(this.simTime)
     };
   };
 
-  var api = { Game: Game };
-  global.CP = global.CP || {};
-  global.CP.Game = Game;
-  if (typeof module !== 'undefined' && module.exports) module.exports = api;
-})(typeof window !== 'undefined' ? window : globalThis);
+  global.GG = global.GG || {};
+  global.GG.World = World;
+  global.GG.BULLET_KINDS = BULLET_KINDS;
+})(window);

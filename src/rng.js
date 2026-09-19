@@ -32,8 +32,8 @@
   }
 
   var api = { createRng: createRng, hashSeed: hashSeed };
-  global.CP = global.CP || {};
-  global.CP.createRng = createRng;
-  global.CP.hashSeed = hashSeed;
+  global.GG = global.GG || {};
+  global.GG.createRng = createRng;
+  global.GG.hashSeed = hashSeed;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof window !== 'undefined' ? window : globalThis);

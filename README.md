@@ -1,167 +1,150 @@
-# COLOR PULSE
+# GALAXY GUNNER
 
-A minimalist circular timing game. The white marker at twelve o'clock never
-moves; the ring of colours turns underneath it. Press once when a colour is
-under the marker. **Every press reverses the direction of rotation and re-rolls
-the width of every colour**, so the ring never looks the same twice.
+A portrait arcade shooter for the browser. Auto-fire, curved enemy entries,
+dense readable bullet patterns, weapon upgrades that arrive live in combat, and
+a boss at the end of every stage.
 
-Built from the supplied Color Smash asset kit and reference clip.
-Created by Hen Asayag.
-
-## Run it
+WebGL first, Canvas 2D fallback, no dependencies, no build step.
 
 ```bash
-node tools/serve.js
+node tools/serve.js 8123
 ```
 
-Then open <http://localhost:8080>.
+Then open <http://localhost:8123>. It also runs from `file://`, with the
+tuning overlay and nothing else disabled.
 
-`index.html` also works opened directly from disk (double-click it). Over
-`file://` the browser blocks `fetch`, so the game automatically falls back to
-pooled `<audio>` elements for sound and to its built-in configuration defaults.
-Serving it is still preferable — that is the path where `config/game-config.json`
-is read and Web Audio is used.
+---
 
-## Controls
+## What this is
 
-| Action | Input |
-|---|---|
-| Strike | Tap the playfield, click, <kbd>Space</kbd>, <kbd>Enter</kbd>, or the **TAP** button |
-| Pause / resume | <kbd>Esc</kbd>, <kbd>P</kbd>, or the pause button |
-| Mute | The speaker button, or the Sound setting in the menu |
-| Full screen | The corner-brackets button, top right |
+This project was **converted** from COLOR PULSE, a circular timing game that
+shared the same engine. The conversion kept every piece of working
+infrastructure and replaced the gameplay layer, the art direction and the
+audio. See `ASSUMPTIONS.md` for what was kept, what was replaced and why.
 
-The full-screen button is aimed at phones, where the address bar eats a good
-part of a portrait viewport. It appears on touch devices and narrow windows
-whenever the browser allows it, and stays reachable from the menus as well as
-during a run, so a phone can be set up before play starts. It hides itself on
-browsers with no element full-screen API (iOS Safari on iPhone) or where the
-host refuses the request, rather than leaving a dead control on screen.
+It is **not** a Phaser project. The kit's implementation notes suggest Phaser 3;
+the existing codebase had its own WebGL layer that worked, so that was kept
+rather than adding a dependency and rebuilding the render path. The kit allows
+this explicitly ("Phaser 3 preferred, or retain the current engine if already
+working").
 
-## Scoring
+## How to play
 
-| Target | Points | Notes |
-|---|---|---|
-| Yellow | +1 | widest |
-| Blue | +2 | |
-| Green | +5 | narrow, hardest |
-| Orange | +3 | also restores one heart, capped at three |
-
-Striking a dark gap costs a heart. So does letting the inner countdown ring run
-out — six seconds per strike. Three hearts; the run ends when the last one goes.
-
-The ring starts at 4.0 rad/s (about 0.64 turns a second) and accelerates with
-your score to a cap of 6.8 rad/s (about 1.08 turns a second), reached at 140
-points. At the cap a yellow sector is under the marker for roughly 160 ms and a
-green one for under 40 ms.
-
-**These values are reconstruction defaults, not rules recovered from the
-original game.** See [ASSUMPTIONS.md](ASSUMPTIONS.md) for what the reference
-clip actually shows and what was completed by design.
+- **Touch** — drag anywhere in the lower three quarters of the screen. The ship
+  rides above your finger so it stays visible. Guns fire by themselves.
+- **Desktop** — move the mouse, or steer with `WASD` / arrow keys.
+- `Space` fires a bomb. `Esc` or `P` pauses.
+- Your hitbox is the cockpit, not the wingspan — much smaller than the ship
+  looks. Weave through bullet lanes rather than going around them.
+- A hit costs a life **and a weapon tier**, so pickups are worth chasing.
+- A red glow around an enemy means a dense attack is 220 ms away.
 
 ## Layout
 
 ```
-index.html              markup and the screen structure
-styles.css              dark minimal shell, menus and controls
-src/config.js           every tuning value, in one object
-src/rng.js              seeded generator (mulberry32)
-src/geometry.js         angle convention and arc maths
-src/ring.js             sectors, spawning, collision
-src/game.js             rules, scoring, lives, state machine
-src/color.js            colour parsing and mixing
-src/layout.js           viewport fitting, shared by both renderers
-src/effects.js          feedback TIMING only: flashes, ripples, labels, pops
-src/gl.js               WebGL plumbing: programs, textures, glyph atlas
-src/renderer-gl.js      WebGL renderer (default)
-src/renderer-2d.js      Canvas 2D renderer (fallback)
-src/audio.js            Web Audio, with an <audio> fallback
-src/input.js            pointer and keyboard
-src/ui.js               screens, settings, persistence, practice coach
-src/main.js             boot, the single animation loop
-assets/svg, assets/audio    the kit artwork and sounds
-config/game-config.json     tuning, read when served over http
-tools/serve.js          zero-dependency static server
-tests/rules.test.js     headless rule tests
-kit/                    the original brief and kit documents, unmodified
+index.html            page shell, screens, script order
+styles.css            page chrome only; the canvas owns the playfield and HUD
+config/
+  game-config.json    runtime tuning overlay, deep-merged over src/config.js
+src/                  the game (see below)
+tests/rules.test.js   headless suite: node tests/rules.test.js
+tools/serve.js        dependency-free static server
+kit/galaxy-gunner/    the supplied conversion kit, as delivered
 ```
 
-Menus and controls are ordinary accessible DOM. There is one animation loop and
-one simulation clock, and the simulation advances only while a run is live.
+### Source modules
 
-## Rendering
+Loaded in this order by `index.html`; each is an ES5 IIFE attaching to `window.GG`.
 
-The playfield is **WebGL**. The whole ring — flash background, charcoal track,
-every colour sector, the inner countdown arc, the ripples and the fixed marker —
-is a single fullscreen quad whose fragment shader evaluates the ring
-analytically in polar coordinates. Nothing is stroked or tessellated on the CPU,
-and every edge is anti-aliased in the shader against its own pixel-space
-distance, so the arcs stay clean at any device pixel ratio. One draw call covers
-the entire ring.
+| Module | Responsibility |
+| --- | --- |
+| `config.js` | every tunable number, in one place |
+| `geometry.js` | scalars, angles, easing, Bezier evaluation |
+| `rng.js` | seeded mulberry32, so a run is reproducible |
+| `color.js` | parse / mix / to-float, shared by both renderers |
+| `pool.js` | the object pool every transient comes from |
+| `layout.js` | viewport fitting, world-unit mapping, safe-area insets |
+| `assets.js` | paints every sprite into one transparent atlas at boot |
+| `gl.js` | WebGL context, programs, buffers, glyph atlas |
+| `renderer-gl.js` | batched sprite renderer (WebGL) |
+| `renderer-2d.js` | the same drawing interface on Canvas 2D |
+| `paths.js` | the spline library the enemy entries are built from |
+| `patterns.js` | the bullet-pattern library |
+| `effects.js` | particles, trails, hit-stop, camera impulse, floating text |
+| `player.js` | ship movement, damage, invulnerability, respawn |
+| `weapons.js` | the six-tier auto-fire ladder and the secondary modules |
+| `enemies.js` | archetypes and the group spawner |
+| `boss.js` | the three encounters, their phases and their death sequence |
+| `pickups.js` | drops, magnetisation, collection |
+| `director.js` | stage timeline, difficulty, the no-dead-air rule |
+| `game.js` | the world: collisions, scoring, the state machine |
+| `scene.js` | draw order and the HUD, written once for both backends |
+| `synth.js` | every sound effect and the music loop, generated |
+| `audio.js` | unlock, mute, voice cap, music bus |
+| `quality.js` | quality levels and the frame-time watchdog |
+| `ui.js` | screens, settings, persistence |
+| `input.js` | one-drag touch, mouse and keyboard |
+| `main.js` | boot, the loop, lifecycle, full screen |
 
-Hearts and text are a second, textured pass drawn **on top of** the ring, which
-is also why a heart can never be covered by a colour. Text has no native form in
-WebGL, so the eleven characters the game actually shows (`0123456789+`) are
-rasterised into a glyph atlas at the exact device-pixel size in use and rebuilt
-on resize — digits stay crisp instead of being scaled from one baked size, and
-they keep the fixed tabular advance so a count-up never shifts sideways.
+## Assets
 
-`src/renderer-2d.js` is an automatic fallback used when a WebGL context cannot
-be created. Both renderers share `src/layout.js` and read the same state out of
-`src/effects.js`, so the two paths cannot drift apart. Append `?renderer=2d` to
-the URL to force the fallback.
+**There are no image or audio files.** Every sprite is painted into a single
+1024-wide transparent atlas at boot by `src/assets.js`, and every sound is
+synthesised into an `AudioBuffer` at audio-unlock by `src/synth.js`.
 
-### Angles
+That was a choice forced by the kit: `03_Assets/` ships three composite concept
+boards and nine **empty** folders, so there were no production sprites to load.
+Generating them buys several things the brief asks for directly — one texture
+means the whole frame batches into a handful of draw calls, the art stays crisp
+at any device pixel ratio, and nothing is traced from any commercial title. The
+palette and silhouettes follow the supplied boards, which are kept in
+`kit/galaxy-gunner/boards/`.
 
-One convention throughout: **0 rad is twelve o'clock, positive is clockwise,
-radians.** It matches the SVG kit. Conversion to canvas space happens in exactly
-one place, `geometry.toCanvasAngle()`. Collision never reads a rendering value.
+To move to hand-authored sprites later, replace `GG.assets.build()` with a
+loader that returns the same `{ canvas, frames }` shape — `frames[name]` being
+`{ x, y, w, h, u0, v0, u1, v1, dw, dh }`. Nothing else has to change.
 
-## Tuning
+## Performance
 
-Everything lives in `src/config.js`. When the game is served over http, the
-values in `config/game-config.json` are fetched and merged over them, so the
-game can be retuned without touching code. **The two files must agree** — a
-stale value in the JSON silently overrides the code, so `tests/rules.test.js`
-fails if they drift apart. Useful knobs:
+Measured in-browser at maximum density — 60 enemies, 480 projectiles, 250
+particles, 20 pickups on a 375×812 viewport at DPR 2:
 
-- `rules.reverseOnPress` — set `false` for continuous one-way rotation
-- `rules.resizeOnPress` — set `false` to keep sector widths fixed for a run
-- `sectors[].spanJitterDeg` — how much a width can swing on each press
-- `rules.timerMode` — `'countdown'` or `'decorative'` (also a menu setting)
-- `rules.seed` — set non-zero to make every run use the same layout
-- `rules.speedStartRadPerSec` / `speedMaxRadPerSec` / `speedPerPoint`
-- `effects.*` — flash, ripple, label and count-up timings
+| | |
+| --- | --- |
+| Draw calls per frame | **20** |
+| Simulation cost | **0.02 ms** per frame |
+| Heap growth over 5 simulated minutes | **0.9 MB** |
 
-## Tests
+The batcher streams every sprite into one vertex buffer and flushes only when
+the texture or the blend mode changes, so the scene draws in ordered passes
+rather than sorting per sprite. Everything transient comes from a pool; the
+only allocation during a run is a pool growing once toward its ceiling.
+
+Three quality levels (High / Medium / Low) change particle budgets, trail
+length, additive blending and the DPR cap. The default is chosen from device
+capability and then corrected by measured frame time; a manual choice in
+Settings disables the watchdog.
+
+## Testing
 
 ```bash
 node tests/rules.test.js
 ```
 
-Headless tests covering angular boundaries and wrap-around, one input to one
-outcome, score farming, the heart cap, timeout handling, pause and hidden-tab
-clock preservation, direction reversal, restart hygiene and seeded determinism.
-Browser-side results are in [TEST_REPORT.md](TEST_REPORT.md).
+48 tests. The simulation has no DOM dependency, so the suite drives whole runs
+headlessly at a fixed timestep — the pacing rules, the pool ceilings and the
+numerical stability are all covered there, not just the pure maths. See
+`TEST_REPORT.md` for what was verified in a browser.
 
-## Accessibility
+## Tuning
 
-- `prefers-reduced-motion` is honoured by default; reduced-motion and
-  reduced-flash are also separate settings
-- Flashes are coalesced rather than stacked, and capped in reduced-flash mode
-- All controls are at least 44×44 CSS px
-- A WebGL failure falls back to Canvas 2D rather than showing a blank page
-- Menus are real focusable DOM; score and life changes go to an `aria-live` region
+`config/game-config.json` is deep-merged over `src/config.js` when the game is
+served over http(s), so pacing, drop rates, difficulty and feel can be changed
+without touching code. Opened from `file://` the fetch fails harmlessly and the
+built-in defaults are used.
 
-## Assets
+`?renderer=2d` forces the Canvas fallback. `?debug` draws the player hitbox.
 
-All artwork and sounds come from the supplied kit and are original work for this
-project. The reference video and contact sheet were used for visual analysis
-only and are **not** shipped as game art. The kit's WAVs are original synthesized
-effects, not audio recovered from the referenced game. No reference music is
-used, and the meme caption and mouse cursor visible in the clip are recording
-overlays that are deliberately not reproduced.
+---
 
-The project's SVG copies are byte-identical to the kit originals except for an
-added explicit `width`/`height` on each root element, which gives `drawImage()`
-a reliable intrinsic size across browsers.
+Created by Hen Asayag.

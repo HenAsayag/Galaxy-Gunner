@@ -1,103 +1,189 @@
-# Evidence and assumptions
+# Conversion record and assumptions
 
-What follows separates what the supplied 10.7-second clip actually shows from
-what this build decided in order to be playable. Nothing in the second list is a
-recovered original rule.
+What was kept from the previous build, what was replaced, and every decision
+taken where the brief was silent or where reality did not match it.
 
-## Observed in the reference clip
+---
 
-Taken from the video and the frame contact sheet, and reproduced here:
+## 1. The brief's premise was wrong in one respect
 
-- Near-black portrait playfield, no background art or gradients
-- Very large white score high in the frame, changing smoothly rather than jumping
-- Three small pink heart slots directly below the score, filled and outlined
-- A thick dark charcoal circular track
-- Yellow, blue and a small green moving arc segment, flat radial ends, separated
-  by dark gaps
-- An occasional orange segment carrying a white heart glyph
-- A stationary thin white marker at twelve o'clock, above the track
-- A thin inner arc with a visible moving gap, shifting between green, lime and
-  yellow
-- A green full-playfield success flash, a red failure flash, an orange
-  heart-collection flash — in every case the ring and its colours stay clearly
-  drawn **on top of** the flash, so the flash is the background, not a wash over
-  the scene
-- A translucent expanding circular pulse
-- Floating `+5` and `+3` labels beneath the hearts, which can appear side by side
-- Lives changing; the excerpt runs from roughly 208 to 239
+The task described the existing project as "a fully working Phaser 3 WebGL
+mobile game", and the kit's `IMPLEMENTATION_NOTES.md` recommends
+`Phaser.AUTO`.
 
-Deliberately **not** reproduced: the meme caption, the mouse cursor, the
-social-video overlays, the music, and the pause glyph near the end (which may
-belong to the video player rather than the game).
+**There is no Phaser in the repository.** The existing game was vanilla ES5
+IIFE modules loaded through `<script>` tags, with a hand-written WebGL layer
+(`src/gl.js`), a polar-coordinate fragment shader renderer and a Canvas 2D
+fallback.
 
-## Supplied by the user
+Adopting Phaser would have meant adding a ~1 MB dependency and rebuilding the
+render, input, audio and scaling paths from scratch — the opposite of the
+instruction not to rebuild. The kit permits keeping the engine ("Phaser 3
+preferred, **or retain the current engine if already working**"), so the
+existing engine was retained.
 
-- **Every press reverses the direction of rotation.** Not derivable from the
-  clip; specified directly during development and implemented as the default
-  (`rules.reverseOnPress`).
-- **Every press re-rolls the width of every colour.** Also specified directly.
-  Each sector keeps its centre and takes a new width from its own range, so the
-  ring reshapes in place rather than jumping (`rules.resizeOnPress`).
-- **The game should be faster.** Rotation was raised from 2.8–5.2 rad/s to
-  4.0–6.8 rad/s, and the ramp now reaches the cap at 140 points instead of 200.
+## 2. What was preserved
 
-## Reconstruction defaults
+Everything below was working, is not gameplay-specific, and was kept:
 
-Each of these is a design decision, configurable in `src/config.js`.
+| System | Where | Change |
+| --- | --- | --- |
+| WebGL context, program compilation, texture upload, glyph atlas | `src/gl.js` | wider glyph set, plus dynamic/index buffer helpers |
+| Seeded RNG (mulberry32) | `src/rng.js` | namespace only |
+| Colour parse / mix / to-float | `src/color.js` | namespace only |
+| Audio unlock on first gesture, master gain, mute, voice cap that drops the oldest voice, attack/release ramps | `src/audio.js` | buffers now come from the synth instead of fetched WAVs; music bus added |
+| `Storage` with in-memory fallback, screen router, throttled ARIA live region | `src/ui.js` | option list and panels replaced |
+| Boot promise chain, rAF loop, resize handling, visibility/blur auto-pause, full-screen negotiation, WebGL→Canvas fallback selection | `src/main.js` | structure kept, wiring changed |
+| Dependency-free static server, `.nojekyll` | `tools/`, root | unchanged |
+| Simulation-clock discipline (pause freezes the clock; a stall is capped, not replayed) | `src/game.js` | carried over as a pattern |
 
-| Area | Default | Why |
-|---|---|---|
-| Input contract | one press judges the sector under the marker | The clip never shows the player's hands or an instruction screen. |
-| Yellow / Blue | +1 / +2 | The clip only ever confirms +5 and +3. Ordered by how wide each target is. |
-| Green | +5 | Confirmed by the clip's `+5` labels alongside green flashes. |
-| Orange | +3, restores one heart, capped at 3 | `+3` and a heart filling are both visible; the cap and the full-health behaviour are choices. At full health it still scores. |
-| Gap press | costs one heart | Consistent with the red flash and heart loss, but the cause is not visible. |
-| Inner arc | a 6-second countdown per strike, reset on every resolved press | The clip shows a thin arc with a moving gap changing colour. A timer is a plausible reading, **not** an established one. `rules.timerMode: 'decorative'` (a menu setting) switches it to pure motion if this reading is wrong. |
-| Timeout | costs one heart, once, then restarts the interval | Never observed. |
-| Speed | 4.0 rad/s, +0.02 per point, capped at 6.8 | Raised at the user request above. The original estimate from the clip was 2.8–5.2; the clip sits near its cap at scores of 208–239. Eased over 450 ms so it never steps. |
-| Sector widths | yellow 62°, blue 46°, green 15°, orange 24°, re-rolled each press within ±18/±14/±5/±6° | Centred on the kit values. The jitter was widened so the per-press resize reads clearly on screen. A width may be squeezed below its range by a neighbour, never above it. |
-| Minimum gap | 26° | Chosen so every target stays reachable. |
-| Orange spawn | 18% per successful hit, never more than one alive | Balancing assumption. |
-| Starting state | score 0, three hearts | The clip's 208 is mid-run. |
-| Respawn | the struck sector fades out and a replacement fades in elsewhere | The clip shows targets in changing positions; the exact mechanism is not visible. |
-| Menus, countdown, game over, practice | all of it | None appear in the clip. |
-| Sounds | the kit WAVs | Original synthesized effects. The recording does not isolate any original game audio. |
-| Font | local bold sans-serif, tabular digits | The original font is unknown. |
+## 3. What was replaced
 
-## Rules the implementation pins down
+| Removed | Why |
+| --- | --- |
+| `ring.js`, the ring rules in `game.js` | the entire previous gameplay |
+| The polar-coordinate scene shader in `renderer-gl.js` | a shmup needs thousands of textured quads, not one analytic ring |
+| `renderer-2d.js` ring drawing | same |
+| `effects.js` ring feedback | replaced with pooled particles, trails, hit-stop |
+| `layout.js` ring composition | replaced with world-unit viewport fitting |
+| `assets.js` SVG loader | replaced with the procedural atlas |
+| `geometry.js` angular maths | replaced with vector/Bezier maths |
+| The ten COLOR PULSE WAVs | wrong game; replaced by synthesis |
 
-These resolve cases the clip could never show, and are worth stating because
-they are decisions rather than physics:
+## 4. Decisions where the brief was silent
 
-- **Sector membership** is inclusive at the start edge and exclusive at the end
-  edge, so two touching sectors can never both claim the marker.
-- **A press and a timeout landing together**: the press carries its input
-  event's timestamp, the simulation is advanced to that instant, and whichever
-  event is earlier in simulation time resolves first. A timeout falling strictly
-  before the press applies first and may end the run, in which case the press is
-  ignored. Either way there is exactly one outcome per press.
-- **Collision is off during transitions.** A sector fading in cannot be struck,
-  and a struck sector stops being judgeable immediately. Nothing invisible is
-  ever judged.
-- **New sectors are always reachable.** The lead a replacement needs is measured
-  in TIME, not degrees, and converted with the current speed — a fixed angle
-  buys less and less warning as the ring accelerates. It must also clear the
-  marker on BOTH sides, because a press can reverse the ring while the sector
-  is still fading in, turning its trailing edge into the leading one.
-- **The struck sector is consumed**, so a single pass cannot be farmed.
-- **A duplicated input inside 110 ms is swallowed.** This absorbs a
-  pointer/click pair or a stray repeat; it is short enough not to block real
-  repeated play.
-- **The simulation clock only runs while a run is live.** Menus, pause, the
-  resume countdown and a hidden tab cannot spend the timer or a heart, and a
-  suspended tab's catch-up delta is clamped rather than replayed.
-- **Resuming always goes back through 3-2-1**, with input dead until it ends.
+### Rendering
 
-## Known limits
+- **A batched sprite renderer was added.** The previous renderer issued one
+  draw call per sprite with per-sprite uniform updates. That is fine for ten
+  hearts and fatal at 300 bullets plus 250 particles. The batcher streams
+  interleaved vertices into one buffer and flushes only on a texture or
+  blend-mode change: 20 draw calls at maximum density.
+- **Both backends implement the same interface**, so `src/scene.js` is written
+  once. The alternative — two scene implementations — is how fallback renderers
+  drift out of sync.
+- **Draw order is: background → pickups → enemies → boss → player → trails →
+  projectiles → particles → flash → HUD.** Projectiles sit above every ship on
+  purpose: at this density the one thing that must never be occluded is the
+  thing that kills you.
 
-- The reference is 10.7 seconds of mid-run footage. Anything about progression,
-  onboarding, failure states or long-run pacing is invention.
-- The speed curve is fitted to a clip that is already near its cap, so the early
-  ramp is unconstrained by evidence.
-- The heart's flight to the HUD is an embellishment consistent with the visible
-  heart feedback, not verified choreography.
+### Assets
+
+- **All art is generated at boot.** The kit's `03_Assets/` contains three
+  composite concept boards and nine empty folders. Cutting clean transparent
+  sprites out of a 1536×1024 marketing board is not reliable, and shipping a
+  game with missing textures is not an option. Sprites are painted
+  parametrically into one atlas, following the boards' palette and silhouettes.
+- **All audio is synthesised at unlock.** Same reason: `03_Assets/audio/` is
+  empty, and the brief requires original sound.
+- The expected `assets/player`, `assets/enemies` … folders from the manifest
+  therefore do not exist. `README.md` documents the single seam
+  (`GG.assets.build()`) to swap in authored sprites later.
+
+### World space
+
+- The simulation runs in a virtual field whose **width is fixed at 450** and
+  whose **height flexes between 720 and 1010** with the device aspect. Fixing
+  the width keeps horizontal difficulty — the width of a bullet lane, the reach
+  of a dodge — identical on every phone; flexing the height gives a full-bleed
+  playfield instead of letterbox bars. Verified full-bleed on 360×640, 375×667,
+  390×844, 412×915 and 430×932.
+- Landscape and desktop cap the field at 760 wide and centre it, with the
+  starfield painted across the margins.
+
+### Feel
+
+- **Follow smoothing is 0.115 s**, inside the brief's 0.10–0.16 s window, using
+  a frame-rate-independent exponential approach so it feels identical at 60 and
+  120 Hz.
+- **The player hitbox is radius 5.5** against a 44-wide sprite — about a
+  quarter of the art, per the brief's insistence that it be the cockpit.
+- **Releasing the finger does not recentre the ship.** It holds station.
+  Yanking the ship on release loses runs the player had already dodged.
+- **A cursor gets no vertical offset**; a fingertip gets 46. A mouse does not
+  cover the ship.
+- **Hit-stop is 0 ms for a normal kill.** The brief's table allows it, and
+  freezing on every one of several hundred kills would feel broken.
+
+### Gameplay rules the brief did not specify
+
+These are reconstruction defaults, chosen for this build:
+
+- **A hit costs a life *and* one weapon tier.** This is the pressure that makes
+  upgrade pickups matter. Without it the ladder only ever goes up.
+- **Score**: base value × multiplier × (1 + combo × 1.2%, combo capped at 30).
+  Combo expires 2.2 s after the last kill.
+- **A boss's exposed core takes double damage**, so the punish window after a
+  phase break is worth taking.
+- **A pity timer forces a pickup every 16 kills without one.** Invisible to the
+  player; it exists because a bad-luck streak would otherwise flatten a whole
+  stage. Drop rates were then tuned around it.
+- **Stage length is 78 s**, inside the brief's suggested 60–90 s, plus a 2.2 s
+  boss warning and a ~12 s boss fight.
+- **Later stages scale enemy health (+22%/stage), path speed and group size.**
+  Group size matters because a player who has climbed the weapon ladder clears
+  an early-stage group in about a second; scaling health alone leaves the screen
+  looking empty however hard it actually is.
+
+### Balance, and how it was arrived at
+
+The first pass was wrong and measurement caught it. Driven by a scripted
+aiming player, a 90-second run reached only weapon tier 2 and the boss would
+have taken ~110 s to kill. Damage, enemy health, drop rates and boss health
+were recalibrated until a 200-second run reached tier 2 at 8 s, tier 4 at 38 s
+and tier 6 at 122 s, with bosses dying in ~12 s. Those numbers are reproducible
+from the headless suite.
+
+### Audio
+
+- Music is one eight-bar loop at 146 BPM, generated from scale degrees.
+- Cues are collapsed if the same one is requested twice within 28 ms — a bomb
+  can kill thirty enemies in one frame, and thirty overlapping explosions is
+  mud, not impact.
+- Menus and pause duck the music rather than cutting it.
+
+### Accessibility
+
+- Reduced motion disables camera impulse and hit-stop and caps the full-screen
+  flash; reduced flashing caps the flash alone. Both default to the OS
+  preference until the player chooses for themselves.
+- All gameplay information is also announced through a throttled ARIA live
+  region.
+- Quality can be forced from Settings, which disables the automatic watchdog.
+
+## 5. Known limitations
+
+- **The procedural art is stylised, not illustrated.** It follows the boards'
+  palette, silhouettes and lighting language, but it is vector-drawn geometry,
+  not the painted look of the concept boards. Swapping in authored sprite
+  atlases later is a single-function change.
+- **The Canvas 2D fallback is dimmer.** `globalCompositeOperation: 'lighter'`
+  is a weaker approximation of additive blending than the GL path, so
+  explosions have less bloom. It is a fallback, and it is correct, not pretty.
+- **Enemy bullet speed does not scale with stage.** Difficulty comes from
+  health, density and pattern choice. A bullet that outruns human reaction is
+  not difficulty.
+- **Three boss encounters, cycled by stage.** Stage 4 fights boss 1 again with
+  more health.
+
+## 6. Files left in the tree
+
+These belong to the previous game and are no longer loaded or referenced.
+Deleting them was blocked by the sandbox, so they are listed here:
+
+```
+src/ring.js
+assets/svg/          (20 SVGs)
+assets/audio/        (10 WAVs)
+kit/ASSET_GUIDE.md  kit/MASTER_PROMPT.md  kit/README_HE.md
+kit/REFERENCE_ANALYSIS.md  kit/VALIDATION.md  kit/effects-baseline.js
+```
+
+They can be removed with:
+
+```bash
+git rm -r src/ring.js assets/svg assets/audio kit/ASSET_GUIDE.md kit/MASTER_PROMPT.md kit/README_HE.md kit/REFERENCE_ANALYSIS.md kit/VALIDATION.md kit/effects-baseline.js
+```
+
+The supplied Galaxy Gunner kit lives at `kit/galaxy-gunner/` and is the source
+of truth for the new game.

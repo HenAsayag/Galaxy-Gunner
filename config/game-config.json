@@ -1,128 +1,45 @@
 {
-  "metadata": {
-    "status": "Proposed tunable defaults, not recovered original source values. reverseOnPress was specified by the user, not derived from the clip.",
-    "referenceSeconds": 10.667,
-    "note": "Mirrors src/config.js and is merged OVER it when the game is served over http(s). Keep both in step: a stale value here silently overrides the code."
+  "_comment": "Runtime tuning overlay for GALAXY GUNNER. Deep-merged over src/config.js when the game is served over http(s); ignored when opened from file://. Only the keys present here are overridden, so this file can stay small.",
+
+  "player": {
+    "followTau": 0.115,
+    "hitRadius": 5.5,
+    "fingerOffsetY": 46,
+    "startLives": 3,
+    "startBombs": 2,
+    "invulnMs": 1500
   },
-  "palette": {
-    "background": "#080909",
-    "track": "#111212",
-    "yellow": "#FFDA00",
-    "blue": "#2467F5",
-    "green": "#19D538",
-    "orange": "#F56B08",
-    "lime": "#BCF128",
-    "heart": "#EF4E73",
-    "white": "#FFFFFF",
-    "emptyHeart": "#67716B"
+
+  "bullets": {
+    "enemySpeed": 300,
+    "enemySpeedFast": 430,
+    "telegraphMs": 220
   },
-  "geometry": {
-    "viewBox": 512,
-    "center": [
-      256,
-      256
-    ],
-    "outerRadius": 204,
-    "outerWidth": 44,
-    "innerRadius": 170,
-    "innerWidth": 12,
-    "markerAngleDegrees": 0,
-    "angles": "0 is top; positive clockwise; radians internally"
+
+  "stage": {
+    "lengthMs": 78000,
+    "maxQuietMs": 700,
+    "difficultyPerStage": 0.22,
+    "maxEnemies": 60
   },
-  "sectors": [
-    {
-      "id": "yellow",
-      "spanDeg": 62,
-      "spanJitterDeg": 18,
-      "points": 1
-    },
-    {
-      "id": "blue",
-      "spanDeg": 46,
-      "spanJitterDeg": 14,
-      "points": 2
-    },
-    {
-      "id": "green",
-      "spanDeg": 15,
-      "spanJitterDeg": 5,
-      "points": 5
-    },
-    {
-      "id": "orange",
-      "spanDeg": 24,
-      "spanJitterDeg": 6,
-      "points": 3,
-      "heals": 1
+
+  "pickups": {
+    "bannerMs": 780,
+    "magnetRadius": 78,
+    "weights": {
+      "weapon": 26, "missile": 14, "shield": 14,
+      "rapid": 12, "multi": 10, "magnet": 8, "bomb": 8
     }
-  ],
-  "rules": {
-    "initialLives": 3,
-    "maxLives": 3,
-    "emptyTapCosts": 1,
-    "holdRepeats": false,
-    "oneRewardPerPress": true,
-    "repeatedTapSamePass": false,
-    "timerSeconds": 6,
-    "speedStartRadPerSec": 4,
-    "speedMaxRadPerSec": 6.8,
-    "speedPerPoint": 0.02,
-    "heartSpawnChancePerSuccess": 0.18,
-    "missScorePenalty": 0,
-    "timeoutCosts": 1,
-    "timerMode": "countdown",
-    "speedRampMs": 450,
-    "baseSectorCount": 3,
-    "minGapDeg": 26,
-    "spawnLeadDeg": 70,
-    "spawnClearDeg": 10,
-    "spawnMs": 130,
-    "despawnMs": 130,
-    "inputCooldownMs": 110,
-    "reverseOnPress": true,
-    "countdownSeconds": 3,
-    "seed": 0,
-    "spawnGraceMs": 250,
-    "resizeOnPress": true,
-    "minSpanDeg": 6,
-    "innerRotateRadPerSec": 0.55,
-    "innerGapDeg": 42
   },
-  "effects": {
-    "success": {
-      "color": "#19D538",
-      "flashMs": 240,
-      "maxAlpha": 0.8,
-      "pulseMs": 280,
-      "scoreScale": 1.15
-    },
-    "miss": {
-      "color": "#FF0505",
-      "flashMs": 300,
-      "maxAlpha": 0.95,
-      "shakeMs": 160,
-      "shakePx": 5
-    },
-    "heal": {
-      "color": "#F56B08",
-      "flashMs": 320,
-      "maxAlpha": 0.85,
-      "heartScale": 1.3
-    },
-    "floatingScore": {
-      "durationMs": 650,
-      "risePx": 26
-    },
-    "reducedMotion": {
-      "flashAlpha": 0.12,
-      "shakePx": 0,
-      "disableZoom": true
-    },
-    "flashCooldownMs": 350
+
+  "feel": {
+    "hitStop": { "normal": 0, "heavy": 14, "elite": 28, "playerHit": 42, "bossPhase": 75 },
+    "shake": { "kill": 0, "heavy": 2.2, "elite": 3.4, "playerHit": 5, "bomb": 7, "boss": 6 }
   },
+
   "audio": {
-    "originalSynthesized": true,
     "masterGain": 0.5,
-    "unlockOnFirstGesture": true
+    "musicGain": 0.22,
+    "maxVoices": 14
   }
 }

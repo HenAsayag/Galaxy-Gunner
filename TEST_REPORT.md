@@ -1,196 +1,214 @@
 # Test report
 
-Two layers: headless rule tests in Node, and browser checks driven through the
-`COLOR_PULSE` test hooks in Chromium (Claude's built-in browser pane), served by
-`node tools/serve.js`.
+Two layers: a headless suite that runs whole simulated games, and a set of
+in-browser checks driven through the real DOM and the real render path.
 
-## Headless rule tests
+- **Headless**: `node tests/rules.test.js` — 48 tests, all passing.
+- **Browser**: Chromium, WebGL and Canvas 2D backends, viewports from 360×640
+  to 780×400 landscape.
 
-```
-node tests/rules.test.js
-→ 40 passed, 0 failed
-```
+---
 
-| Group | Covered |
-|---|---|
-| Angles | `norm` over any input; membership inclusive at the start edge and exclusive at the end; wrap-around across the 0/2π seam; two touching sectors never both claim an angle; overlap detection across the seam |
-| Ring layout | 200 seeds: the marker always opens inside a dark gap; no sector overlaps; the minimum gap always holds |
-| Spawning | 150 seeds × both directions: a new sector is never placed on the marker and always has travel left before reaching it; a sector is unjudgeable while fading in or out |
-| Scoring | each colour awards its configured points; one press gives exactly one outcome and a duplicate is swallowed; a single pass cannot be farmed; a gap press costs one heart and no score |
-| Hearts | the cap holds; orange still scores at full health; exactly one heart is restored when one is missing; never more than one orange alive |
-| Direction | every press flips the direction, ring and game stay in step, and travel actually reverses |
-| Widths | every press re-rolls every sector width (20/20 presses); a width may be squeezed below its colour range by a neighbour but never inflated above it |
-| Spawn timing | across 10 seeded runs, no sector still fading in ever sits on the marker, including across the reversals a press causes |
-| Config |  is merged OVER the code defaults when served, so a drift test fails the suite if the two disagree on any rule or sector width |
-| Timer | expiry costs one heart and restarts the interval; one long frame cannot charge two timeouts; a hit resets the interval; decorative mode never charges one |
-| Pause / hidden | pausing freezes timer, angle and clock; presses are ignored while paused; resuming re-enters the countdown with input dead; a 30-second suspension cannot bank penalties |
-| Game over | fires exactly once at zero lives; no press registers afterwards; practice never ends a run or spends a heart |
-| Restart | score, lives, timer, direction, targets and pending spawns all reset; the same seed reproduces a run exactly and different seeds diverge |
-| Speed | ramps to the cap without exceeding it; largest single-frame change 0.063 rad/s, i.e. no visible stepping |
-| Consistency | a 4000-frame bot run ends with the score exactly equal to the sum of its awards |
-| Spacing | `freeIntervals` merges overlapping and wrapping blocked runs, and no free run overlaps a blocked one; across 12 seeded bot runs no two visible sectors ever overlap or come closer than the 26° minimum gap |
+## 1. Headless suite
 
-## Rendering
+The simulation has no DOM dependency, so the suite loads the fifteen non-DOM
+modules into a VM context and drives real runs at a fixed 60 Hz timestep. That
+means the pacing and budget rules are tested against the actual game, not
+against a model of it.
+
+| Group | Covers |
+| --- | --- |
+| maths | frame-rate independence of the follow, no overshoot, shortest-arc turning, Bezier continuity across segment joins |
+| object pools | dense live range after a swap-remove, the ceiling returning null rather than growing, reverse sweeps, actual object reuse |
+| enemy paths | all 17 templates finite across their range and inside a sane band, mirroring is a true reflection, descending paths report a downward heading, unknown names fall back |
+| bullet patterns | every pattern fires, no NaN or stationary bullets, the green wall always leaves a gap ≥ 74 units over 60 seeds, column spacing, aimed fire actually aims, every dense pattern is telegraphed |
+| weapon ladder | every tier differs from the one below in ports/sprite/cadence, projectile count never drops, cadence never slows, tier 6 adds a second fire mode, upgrades cap and report it, every module is reachable in one run |
+| player | hitbox is under a third of the art, bounds hold under extreme input, vertical freedom is 55%, invulnerability blocks stacked hits, a shield absorbs exactly one, the run ends exactly once |
+| stage flow | beats sorted and in range, every beat names a real archetype and path, every archetype names a real pattern, no authored hole over 5 s, the guaranteed weapon drop lands in the heavy phase, the elite arrives before the climax |
+| full run | the no-dead-air rule, the same rule during boss warning and stage clear, every performance budget over 300 s, numerical stability, escalation through three stages and two bosses, upgrades actually arriving, mortal runs ending cleanly, pause freezing the clock, a long stall being capped rather than replayed |
+
+### The regression that suite exists for
+
+The brief requires that there is "almost never more than ~0.5–0.8 sec with
+nothing to shoot". The first implementation applied that rule only during the
+stage phase, so the 2.2 s boss warning and the 1.8 s stage-clear window were
+silent. Measured:
+
+| | Longest empty stretch |
+| --- | --- |
+| Rule scoped to the stage phase (the bug) | **4650 ms** |
+| Rule applied in every phase (the fix) | **717 ms** |
+
+717 ms is the 700 ms budget plus one frame. The test was confirmed to fail when
+the fix is stubbed out, so it is a real guard and not a tautology.
+
+---
+
+## 2. Performance, measured in-browser
+
+375×812 at DPR 2 (751×1624 backbuffer), WebGL backend, High quality, pools
+deliberately saturated: **60 enemies, 260 enemy bullets, 220 player bullets,
+250 particles, 20 pickups**.
+
+| Metric | Result | Budget |
+| --- | --- | --- |
+| Draw calls per frame at max density | **20** | — |
+| Draw calls in normal play | 6–14 | — |
+| Simulation cost per frame | **0.020 ms** | 16.7 ms |
+| Enemies | 60 / 60 | 60 |
+| Enemy + player projectiles | 480 | 300 concurrent in normal play (ceiling is deliberately higher) |
+| Particles | 250 / 250 | 250 |
+| Heap growth, 5 simulated minutes | **0.88 MB** | — |
+
+Every pool stopped exactly at its configured ceiling; none exceeded it.
+
+### Batching
+
+The naive approach — one draw call per sprite — would have been ~800 calls per
+frame at that density. Three changes brought it to 20:
+
+1. a streaming vertex buffer with one atlas texture;
+2. particles drawn in two passes grouped by blend mode instead of one
+   interleaved loop (interleaving flipped the blend mode, and so flushed the
+   batch, several times per explosion);
+3. the same grouping for enemies (telegraph glow / hull / hit flash / health
+   bar) and for pickups (glow / coin).
+
+### Five-minute stress
+
+Ran 300 simulated seconds at maximum density with a scripted player. No
+stutter, no pool overflow, no non-finite value, 0.88 MB of heap growth — which
+is pool arrays reaching their steady size, not per-frame churn. Two remaining
+per-event allocations were removed during this pass: a `Path` object per enemy
+spawn (now configured in place on the pooled enemy) and an input target object
+per frame (now a reused scratch object).
+
+---
+
+## 3. Layout
+
+Computed and verified for every size. "Full bleed" means the playfield covers
+the whole canvas with no letterbox.
+
+| Viewport | World units | Scale | Letterbox | Ship band |
+| --- | --- | --- | --- | --- |
+| 360×640 | 450×800 | 0.800 | none | 54.8% |
+| 375×667 | 450×800 | 0.833 | none | 54.8% |
+| 390×844 | 450×974 | 0.867 | none | 55.7% |
+| 412×915 | 450×999 | 0.916 | none | 55.8% |
+| 430×932 | 450×975 | 0.956 | none | 55.7% |
+| 344×882 (extreme) | 394×1010 | 0.873 | none | 55.8% |
+| 780×400 (landscape) | 760×720 | 0.556 | 179 px each side | 54.2% |
+| 1280×800 (desktop) | 760×720 | 1.111 | 218 px each side | 54.2% |
+
+- World **width is fixed at 450** on every portrait size, so a bullet lane is
+  the same fraction of the screen on a 360-wide phone as on a 430-wide one.
+- The ship's vertical band is 54–56% everywhere, matching the brief's "roughly
+  lower 55–60%".
+- Landscape centres the field and paints the starfield across the margins. The
+  DOM chrome (pause, mute, full screen, bomb) is anchored to the playfield
+  column rather than the viewport edge — verified: with a 179 px margin, the
+  chrome's right edge sits at 593 px against a field edge of 601 px.
+
+Rendered and visually confirmed at 360×640 (menu and gameplay), 375×812
+(menu, gameplay, boss) and 780×400 (landscape gameplay).
+
+---
+
+## 4. Browser behaviour
 
 | Check | Result |
-|---|---|
-| Backend | `webgl` — `WebGL 1.0 (OpenGL ES 2.0 Chromium)` |
-| `gl.getError()` | `0` across menu, gameplay, all three flash types and the sprite pass |
-| Glyph atlas | built for both sizes (`score`, `label`), rasterised at the device-pixel sizes actually in use (111px / 34px at DPR 2) and rebuilt on resize |
-| Uncaught errors | none, captured via a `window.onerror` probe over a full scripted run |
-| Fallback | `?renderer=2d` produces `canvas2d` with a live 2D context and a visually identical frame |
-| Parity | WebGL and Canvas 2D captures of the same scripted run (green hit → blue hit → heart pickup) are visually indistinguishable: same composition, same flash, same three stacked labels, same heart flight |
+| --- | --- |
+| Boot, WebGL path | 30 requests, all 200, **no 404s** — there are no image or audio files to miss |
+| `?renderer=2d` forces the Canvas fallback | backend reports `canvas2d`, all entities/HUD/banner render correctly |
+| Audio unlock on first gesture | 16 cues synthesised, music loop built, `unlocked: true` |
+| Mouse steering | pointer world position tracks the ship exactly, with no finger offset applied |
+| Pause via the HUD button | state `paused`, screen shown, input disabled, simulation clock frozen (verified over 400 ms) |
+| Resume | state `playing`, input re-enabled, 2175 ms of grace invulnerability granted |
+| Bomb button | consumes a charge, clears enemy bullets, damages everything; correctly refuses while the ship is respawning |
+| Death | state `gameover` at zero lives, game-over panel after the explosion settles |
+| HUD does not collide with the on-screen buttons | weapon-tier pips originally rendered underneath the bomb button (pip box right edge 361 px vs button left edge 303 px); moved to the bottom-left and re-verified as non-overlapping |
+| HUD hidden on the menus | the canvas HUD is gated on the run state, so no score or hearts sit behind the menu panel |
+| Best score persistence | written to `localStorage` and shown on the menu across reloads |
+| Settings persistence | sound, music, reduced motion, reduced flashing and quality all round-trip |
 
-### Hearts are never covered by a colour
+### Accessibility settings
 
-Verified by reading the WebGL framebuffer with the orange collectible parked on
-the marker:
+| Setting | Verified effect |
+| --- | --- |
+| Reduced motion | camera impulse forced to `[0, 0]`, hit-stop forced to 0 ms, flash capped at 0.14 |
+| Reduced flashing | flash capped at 0.14, motion untouched |
+| Both | default to the OS `prefers-reduced-motion` until the player chooses |
 
-- centre of the heart badge → `[255, 255, 255]`, the white heart
-- the orange arc beside it → `[245, 107, 8]`, exactly `#F56B08`
+### Quality levels
 
-Hearts and text are a separate textured pass drawn after every arc, so no colour
-can paint over them. The collected heart's flight is drawn last of all, above
-the floating labels.
+| Level | Particle cap | DPR cap | Additive | Stars |
+| --- | --- | --- | --- | --- |
+| High | 250 | 2.5 | yes | 150 |
+| Medium | 150 | 2.0 | yes | 100 |
+| Low | **70** | **1.25** | **no** | **60** |
 
-## Browser checks
+Verified that selecting Low applies all four immediately and disables the
+automatic watchdog; selecting Automatic re-enables it.
 
-| Check | Result |
-|---|---|
-| Console errors | none from game code. The only warnings came from the test probes' own `getImageData` calls |
-| Network | all requests `200`. No 404s, no external requests |
-| Assets | 13/13 SVGs loaded; `images.__missing` empty |
-| Audio (http) | mode `buffer`; 10/10 WAVs prefetched and decoded; `AudioContext` created only on a gesture and reaching `running`; master gain 0.5 |
-| Audio (`file://` path) | with `fetch` forced to fail, the engine falls back to mode `element`, builds 10 pools of 3, plays, and returns `false` while muted |
-| Config fallback | with `fetch` failing, built-in defaults remain valid and complete |
-| One input, one outcome | one `pointerdown` → 1 judgement; an immediately following duplicate → still 1; a right-click → still 1; a non-primary pointer (second finger) → still 1 |
-| Controls do not strike | `pointerdown` on the pause button produced 0 judgements |
-| Listener hygiene | after 20 restarts, one click on *Play again* produced exactly 1 `game.start` |
-| Mute across restart | muted, then 20 restarts → still muted; `sound:false` persisted to `localStorage` |
-| Touch target sizes | full screen 44×44, pause 44×44, mute 44×44, TAP 132×44 |
-| Best score | persisted and re-read across runs |
+#### A bug the watchdog testing found
 
-### Full screen
+The frame-time watchdog demoted a machine that was in fact running at 60 fps.
+The main loop clamped its delta to 120 ms and the watchdog discarded outliers
+"above 120 ms" — so every frame following a tab stall or GC pause arrived as
+exactly 120 ms, slipped past the filter, and dragged the average over the
+demotion threshold. The loop now hands the watchdog the **raw** delta and the
+outlier threshold is 90 ms. Confirmed: quality stays `high` through the
+1-second compositor stalls the test environment produces.
 
-The button renders at 44×44 with the correct label and `aria-pressed`, is wired
-to `requestFullscreen` on `documentElement`, swaps its icon on
-`fullscreenchange`, triggers a re-layout, and suppresses the blur auto-pause for
-700 ms so entering full screen cannot pause a live run.
+---
 
-**Entering full screen could not be verified end to end**: the desktop app's
-browser pane refuses the API outright (`TypeError: Permissions check failed`)
-even from a real click with user activation, although it reports
-`document.fullscreenEnabled === true`. What was verified is the refusal path —
-when the request rejects, the button hides itself and the HUD collapses rather
-than leaving a dead control, and the game keeps running normally. This needs a
-check on a real phone browser.
+## 5. Balance, measured
 
-### Layout fitting
+Runs driven by a scripted player at a fixed timestep. Two drivers: a precise
+one and a "sloppy" one with a 200 ms reaction delay and ±35 units of aim error.
 
-`layout.compute` was run across the required sizes. In every case the ring
-clears the hearts, stays inside the viewport bottom, and fits the width:
+### The first pass was wrong
 
-| Viewport | Ring Ø | Score px | Heart px | Ring top → bottom |
-|---|---|---|---|---|
-| 320×568 | 262 | 54 | 16 | 176 → 439 |
-| 375×667 | 308 | 63 | 19 | 214 → 521 |
-| **390×844** | **320** | **66** | **20** | 298 → 618 |
-| 414×896 | 339 | 70 | 21 | 318 → 658 |
-| 460×634 | 360 | 74 | 22 | 183 → 543 |
-| 844×390 (landscape) | 200 | 41 | 12 | 136 → 336 |
-| 1024×500 (desktop) | 305 | 63 | 19 | 163 → 468 |
-| 300×480 | 246 | 50 | 15 | 168 → 414 |
+| | Initial tuning | After recalibration |
+| --- | --- | --- |
+| Weapon tier after 90 s | **2** | 5 |
+| Time to tier 2 | 44 s | **8 s** |
+| Time to tier 4 | never | **38 s** |
+| Time to tier 6 | never | **122 s** |
+| Time to kill a boss | ~110 s | **~12 s** |
+| Pickups collected in 200 s | ~3 | **49** |
 
-At 390 px the ring is 320 px and the score 66 px, both inside the brief's
-targets (290–330 and 60–72). Resizing recomputes the layout without resetting
-the run; the device pixel ratio is handled separately from the CSS size and
-capped at 2.5.
+Tier damage, enemy health, drop rates and boss health were all adjusted, and a
+pity timer added (a forced drop every 16 kills without one) so an unlucky
+streak cannot flatten a stage.
 
-## Visual pass against the reference
+### Steady state, 300 s
 
-Captured from the running game and compared with the frame contact sheet:
+| | Precise driver | Sloppy driver |
+| --- | --- | --- |
+| Stages reached | 3 | 3 |
+| Kills | 400 | 418 |
+| Score | 87,957 | 86,014 |
+| Peak enemies on screen | 15 | 16 |
+| Peak enemy bullets | 60 | 70 |
+| Longest empty stretch | 717 ms | 717 ms |
 
-- **Normal rotation** — dark charcoal track, yellow/blue/small-green sectors with
-  flat radial ends and dark gaps, huge white score, three pink hearts below it,
-  thin white marker fixed at twelve o'clock, bright green inner arc with a
-  visible gap. Matches the clip's composition closely.
-- **Green hit** — full-playfield green with the ring and its colours still clearly
-  drawn on top, `+5` under the hearts, score counting up. Matches the reference
-  green frames, including the flash being *behind* the ring rather than over it.
-- **Heart pickup** — orange field, `+3`, the collected heart travelling to its HUD
-  slot, the restored heart popping. Matches the reference orange frame.
-- **Miss** — red field, ring on top, a heart emptied, and the ring group shaken
-  while the HUD stays still. Matches the reference red frame.
-- **Game over / how-to / menu** — no reference exists for these; they follow the
-  same restrained visual language.
+Stage cadence: 78 s of waves → 2.2 s boss warning → ~12 s boss → 1.8 s clear,
+about 94 s per stage.
 
-## Bugs found and fixed during verification
+---
 
-1. **Inner arc rendered black on every hit.** `mixHex` returned `rgb(...)` but its
-   parser only accepted hex, so feeding its own output back in for the reset
-   pulse produced `NaN` and an invalid stroke colour.
-2. **The marker could open on top of a sector.** The opening layout closed the
-   circle exactly, so a positive starting offset put angle 0 inside the *last*
-   sector instead of the first gap. Caught by a 200-seed test.
-3. **Replacement sectors spawned behind the marker after a reversal.** Sectors
-   are placed inside `award()`, which ran before the direction flip. The flip now
-   happens between judging and awarding.
-4. **The loading screen never faded out**, because the UI did not know it was the
-   initially visible screen.
-5. **The travelling heart and the `+N` labels fought over the same band.** Hearts
-   now draw last, so they are never covered.
-6. **`+1`/`+2` in the how-to were clipped by the scrollbar.**
-7. **`half` is a reserved word in GLSL**, so the ring shader failed to compile and
-   every load silently fell back to Canvas 2D.
-8. **Floating labels could march off the screen.** Each simultaneous label took
-   a new lane 40px further out with no bound, so a fast streak pushed the
-   outermost ones past the viewport edge. The group is now clamped, and both
-   renderers clamp again at draw time as a final guard. Verified with 12
-   labels alive at once: all stayed within the playfield.
-9. **Sectors could spawn touching, with no dark gap between them.** To keep
-   spacing, each existing sector is padded by the minimum gap before free
-   space is computed — which makes neighbouring blocked intervals overlap.
-   `freeIntervals` assumed they were disjoint and walked them pairwise, so an
-   overlapping pair produced a phantom free run spanning other sectors, and a
-   replacement could be placed hard against a neighbour. Measured before the
-   fix: 91,947 violations in 1.3M pair checks, gaps down to 0°. After: zero
-   violations, zero overlaps, smallest gap exactly 26.0°. The spawn tests had
-   missed it because they ran against an empty ring. Spotted in a screenshot
-   of the deployed site.
-10. **The faster ring made new targets unhittable.** The spawn lead was a fixed
-    70°, which at 2.8 rad/s bought 436 ms but at the new 6.8 rad/s only 180 ms —
-    less than the 130 ms fade-in plus any margin, so a replacement could turn
-    collidable essentially on the marker. The lead is now measured in time and
-    converted with the current speed.
-11. **A reversal could strand a sector fading in on the marker.** Placement only
-    guaranteed clearance on the leading side, but a press reverses the ring, and
-    a press can land while a sector is still fading in — turning its trailing
-    edge into the leading one. Measured: 14 occurrences across 30 seeded runs.
-    Placement now requires clearance on both sides; after the fix, 0.
-12. **The speed increase never reached the served game.**
-     is fetched and merged over the code defaults, and
-    it still held the old 2.8–5.2 rad/s, so the browser silently ran at the old
-    speed while the source said otherwise. Caught by checking the live value
-    rather than trusting the edit. The JSON is now generated from the code
-    defaults, and a test fails the suite if they ever drift apart — verified by
-    reintroducing the stale value and watching it fail.
-13. **The Canvas 2D fallback could not get a context.** A canvas is bound to the
-   first context type it hands out, and the failed WebGL attempt had already
-   taken it, so `getContext('2d')` returned `null` and every frame threw. The
-   fallback now swaps in a fresh canvas element first.
+## 6. Not covered here
 
-## Not verified
-
-- **Entering full screen**, as above — the browser pane blocks the API.
-- Real touch hardware. Touch was exercised through synthetic `PointerEvent`s and
-  emulated viewports, not on a physical device.
-- GPUs and drivers other than the Chromium build in Claude's browser pane. The
-  shaders are WebGL 1 / GLSL ES 1.00 with no extensions, loop bounds are
-  constant and uniform arrays are indexed by the loop variable only, which is
-  the portable subset. Context loss is handled; automatic restore is not
-  implemented.
-- Browsers other than that Chromium build. The code uses no APIs outside the
-  common baseline and includes fallbacks for WebGL, `AudioContext`,
-  `decodeAudioData`'s callback form, `ResizeObserver` and `localStorage`.
-- Audio was verified as decoded, routed and gated, but not listened to.
-- Long-session behaviour beyond the ~3-minute bot runs in the headless tests.
+- **Real device testing.** Everything above is Chromium with device emulation.
+  Actual iOS Safari and Android Chrome behaviour — particularly thermal
+  throttling, the real audio unlock gesture and `100dvh` with a collapsing
+  address bar — has not been measured on hardware.
+- **Multi-touch.** The logic (a second finger never steals control from the one
+  steering; `pointercancel` releases cleanly) is implemented and readable, but
+  emulation cannot generate genuine simultaneous touch points.
+- **Sustained thermal load.** The five-minute stress is simulation time on a
+  desktop, not five minutes of a phone's GPU getting hot.
+- **Sound quality judgement.** The cues are verified to generate and play; how
+  they actually sound is a subjective call best made on a device.

@@ -1,22 +1,73 @@
-/* Headless rule tests. Run with:  node tests/rules.test.js
+/* Headless tests. Run with:  node tests/rules.test.js
  *
- * These cover the verification list in MASTER_PROMPT.md section 8 that can be
- * checked without a browser: angular boundaries and wrap-around, one input to
- * one outcome, timeout/press ordering, score farming, the heart cap, losing at
- * zero lives exactly once, paused and hidden timer preservation, count-up
- * correctness and restart hygiene. Browser-only items (listeners, touch
- * sizes, resize) are covered in TEST_REPORT.md.
+ * These cover what can be checked without a browser: the maths the path
+ * system is built on, the pool invariants that the no-GC-stutter requirement
+ * depends on, the bullet-pattern readability rules, the weapon ladder's
+ * promise that every tier is visibly different, the stage timeline, and the
+ * layout mapping across the three portrait sizes the brief names.
+ *
+ * Browser-only items (WebGL batching, touch handling, listener hygiene, real
+ * frame rate) are covered in TEST_REPORT.md.
+ *
+ * The browser modules are ES5 IIFEs that attach to `window`, so the harness
+ * below creates a minimal global and evaluates them in order - the same order
+ * index.html loads them in. That keeps one source of truth for the code under
+ * test rather than a Node-only duplicate.
  */
 'use strict';
 
 const assert = require('assert');
-const G = require('../src/geometry.js');
-const { CONFIG } = require('../src/config.js');
-const { createRng } = require('../src/rng.js');
-const { Ring } = require('../src/ring.js');
-const { Game } = require('../src/game.js');
+const fs = require('fs');
+const path = require('path');
+const vm = require('vm');
 
-const TAU = G.TAU;
+const ROOT = path.resolve(__dirname, '..');
+
+/* ---- harness --------------------------------------------------------------- */
+
+/* Just enough DOM for the modules that touch it at load time. None of the
+ * modules under test here draw anything; the ones that would (assets, the two
+ * renderers, scene, ui, input, main) are simply not loaded. */
+function createSandbox() {
+  const sandbox = {
+    console,
+    performance: { now: () => Date.now() },
+    Math,
+    Date,
+    JSON,
+    setTimeout,
+    requestAnimationFrame: () => 0
+  };
+  sandbox.window = sandbox;
+  sandbox.global = sandbox;
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+
+  /* Every module that does not touch the DOM, which is enough to run the
+   * whole simulation headlessly - the renderers, the atlas, the synth and the
+   * DOM shell are the only pieces left out. */
+  const files = [
+    'src/config.js', 'src/geometry.js', 'src/rng.js', 'src/color.js',
+    'src/pool.js', 'src/paths.js', 'src/patterns.js', 'src/effects.js',
+    'src/player.js', 'src/weapons.js', 'src/enemies.js', 'src/boss.js',
+    'src/pickups.js', 'src/director.js', 'src/game.js'
+  ];
+  for (const file of files) {
+    vm.runInContext(fs.readFileSync(path.join(ROOT, file), 'utf8'), sandbox, { filename: file });
+  }
+  return sandbox;
+}
+
+const GG = createSandbox().GG;
+const M = GG.math;
+
+/* A fresh config per test, so one test cannot tune another. */
+function freshConfig(overrides) {
+  const config = JSON.parse(JSON.stringify(GG.CONFIG));
+  if (overrides) GG.mergeConfig(config, overrides);
+  return config;
+}
+
 let passed = 0;
 const failures = [];
 
@@ -33,682 +84,622 @@ function test(name, fn) {
 
 function section(title) { console.log('\n' + title); }
 
-/* A fresh config per test, so one test cannot tune another. */
-function freshConfig(overrides) {
-  const config = JSON.parse(JSON.stringify(CONFIG));
-  Object.assign(config.rules, overrides || {});
-  return config;
-}
+/* ---- maths ------------------------------------------------------------------ */
 
-function newGame(overrides, seed) {
-  const config = freshConfig(overrides);
-  const events = [];
-  const game = new Game(config, {
-    rng: createRng(seed === undefined ? 1234 : seed),
-    onEvent: (type, payload) => events.push({ type, ...payload })
-  });
-  game.events = events;
-  return game;
-}
+section('maths');
 
-/* Drive the game the way requestAnimationFrame would. */
-function run(game, ms, step = 16) {
-  for (let i = 0; i < Math.round(ms / step); i++) {
-    game.lastNowCursor = (game.lastNowCursor || 0) + step;
-    game.advanceTo(game.lastNowCursor);
-  }
-  return game.lastNowCursor;
-}
-
-function startPlaying(game, seed) {
-  game.lastNowCursor = 0;
-  game.start(0, { seed: seed === undefined ? 1234 : seed });
-  run(game, 3300);
-  assert.strictEqual(game.state, 'playing', 'expected countdown to finish');
-  return game;
-}
-
-/* ------------------------------------------------------------ geometry --- */
-
-section('Angles: boundaries and wrap-around');
-
-test('norm maps any angle into [0, TAU)', () => {
-  assert.ok(G.norm(-0.001) > 6.28 && G.norm(-0.001) < TAU);
-  assert.strictEqual(G.norm(TAU), 0);
-  assert.ok(Math.abs(G.norm(TAU * 3 + 1) - 1) < 1e-9);
-  assert.ok(G.norm(-TAU * 5 - 1) >= 0 && G.norm(-TAU * 5 - 1) < TAU);
+test('approach is frame-rate independent', () => {
+  /* One 100 ms step and ten 10 ms steps must land in the same place, or the
+   * ship would feel different at 30, 60 and 120 Hz. */
+  const one = M.approach(0, 100, 0.12, 0.1);
+  let many = 0;
+  for (let i = 0; i < 10; i++) many = M.approach(many, 100, 0.12, 0.01);
+  assert.ok(Math.abs(one - many) < 1e-9, `${one} vs ${many}`);
 });
 
-test('arcContains is inclusive at the start edge, exclusive at the end', () => {
-  assert.strictEqual(G.arcContains(1, 0.5, 1), true, 'start edge is inside');
-  assert.strictEqual(G.arcContains(1, 0.5, 1.5), false, 'end edge is outside');
-  assert.strictEqual(G.arcContains(1, 0.5, 1.4999), true);
-  assert.strictEqual(G.arcContains(1, 0.5, 0.9999), false);
-});
-
-test('arcContains works across the 0 / TAU seam', () => {
-  const start = TAU - 0.2;          /* spans the seam: [TAU-0.2, 0.3) */
-  const span = 0.5;
-  assert.strictEqual(G.arcContains(start, span, 0), true, 'the marker at 0');
-  assert.strictEqual(G.arcContains(start, span, TAU - 0.1), true);
-  assert.strictEqual(G.arcContains(start, span, 0.29), true);
-  assert.strictEqual(G.arcContains(start, span, 0.31), false);
-  assert.strictEqual(G.arcContains(start, span, TAU - 0.21), false);
-});
-
-test('two touching sectors never both claim the same angle', () => {
-  const a = { start: 1.0, span: 0.5 };   /* [1.0, 1.5) */
-  const b = { start: 1.5, span: 0.5 };   /* [1.5, 2.0) */
-  for (let x = 0.9; x < 2.1; x += 0.01) {
-    const inA = G.arcContains(a.start, a.span, x);
-    const inB = G.arcContains(b.start, b.span, x);
-    assert.ok(!(inA && inB), 'overlap at ' + x.toFixed(3));
-  }
-  assert.strictEqual(G.arcContains(a.start, a.span, 1.5), false);
-  assert.strictEqual(G.arcContains(b.start, b.span, 1.5), true);
-});
-
-test('arcsOverlap detects wrap-around overlap', () => {
-  assert.strictEqual(G.arcsOverlap(TAU - 0.2, 0.5, 0.1, 0.2), true);
-  assert.strictEqual(G.arcsOverlap(TAU - 0.2, 0.1, 0.1, 0.2), false);
-});
-
-/* ---------------------------------------------------------------- ring --- */
-
-section('Ring layout and spawning');
-
-test('opening layout leaves the marker in a dark gap', () => {
-  for (let seed = 1; seed <= 200; seed++) {
-    const ring = new Ring(freshConfig(), createRng(seed));
-    ring.reset();
-    assert.strictEqual(ring.hitTest(0), null, 'seed ' + seed + ' starts on a sector');
+test('approach never overshoots', () => {
+  for (const dt of [0.001, 0.016, 0.1, 1, 10]) {
+    const v = M.approach(0, 100, 0.12, dt);
+    assert.ok(v >= 0 && v <= 100, `dt=${dt} gave ${v}`);
   }
 });
 
-test('opening sectors never overlap and keep the minimum gap', () => {
-  const config = freshConfig();
-  const minGap = G.degToRad(config.rules.minGapDeg) - 1e-9;
-  for (let seed = 1; seed <= 200; seed++) {
-    const ring = new Ring(config, createRng(seed));
-    ring.reset();
-    const list = ring.sectors;
-    for (let i = 0; i < list.length; i++) {
-      for (let j = i + 1; j < list.length; j++) {
-        assert.ok(!G.arcsOverlap(list[i].start, list[i].span, list[j].start, list[j].span),
-          'overlap on seed ' + seed);
-      }
-      /* distance from this sector's end to the next sector's start */
-      const end = G.norm(list[i].start + list[i].span);
-      let nearest = TAU;
-      list.forEach((other, j) => {
-        if (i === j) return;
-        nearest = Math.min(nearest, G.cwDelta(end, other.start));
-      });
-      assert.ok(nearest >= minGap, 'gap too small on seed ' + seed + ': ' + nearest);
+test('turnToward is rate limited and takes the short way round', () => {
+  const step = 0.1;
+  /* from just below PI to just above -PI: the short way is forward */
+  const next = M.turnToward(3.10, -3.10, step);
+  assert.ok(Math.abs(M.angleDelta(3.10, next)) <= step + 1e-9);
+  assert.ok(Math.abs(M.angleDelta(next, -3.10)) < Math.abs(M.angleDelta(3.10, -3.10)));
+});
+
+test('angleDelta stays inside (-PI, PI]', () => {
+  for (let a = -10; a <= 10; a += 0.37) {
+    for (let b = -10; b <= 10; b += 0.53) {
+      const d = M.angleDelta(a, b);
+      assert.ok(d > -Math.PI - 1e-9 && d <= Math.PI + 1e-9, `${a}->${b} = ${d}`);
     }
   }
 });
 
-test('a spawned sector is never already under the marker, in either direction', () => {
-  const config = freshConfig();
-  for (const direction of [1, -1]) {
-    for (let seed = 1; seed <= 150; seed++) {
-      const ring = new Ring(config, createRng(seed));
-      ring.reset();
-      ring.direction = direction;
-      const ringAngle = (seed / 150) * TAU;
-      ring.sectors = [];
-      assert.ok(ring.spawn('green', ringAngle), 'spawn failed, seed ' + seed);
-      const s = ring.sectors[0];
-      const abs = G.norm(ringAngle + s.start);
-      assert.strictEqual(G.arcContains(abs, s.span, 0), false,
-        'spawned onto the marker, dir ' + direction + ' seed ' + seed);
+test('cubic chain is continuous across segment joins', () => {
+  const pts = GG.paths.TEMPLATES.hookLeft.pts;
+  const out = { x: 0, y: 0, dx: 0, dy: 0 };
+  let prev = null;
+  for (let t = 0; t <= 1.0001; t += 1 / 256) {
+    M.chainAt(pts, Math.min(1, t), out);
+    if (prev) {
+      const jump = Math.hypot(out.x - prev.x, out.y - prev.y);
+      assert.ok(jump < 0.05, `discontinuity of ${jump.toFixed(4)} at t=${t.toFixed(3)}`);
+    }
+    prev = { x: out.x, y: out.y };
+  }
+});
+
+/* ---- pools -------------------------------------------------------------------- */
+
+section('object pools');
+
+test('obtain and releaseAt keep live items dense', () => {
+  const pool = new GG.Pool(() => ({ id: 0 }), null, 8);
+  for (let i = 0; i < 8; i++) pool.obtain().id = i;
+  assert.strictEqual(pool.live, 8);
+  pool.releaseAt(3);
+  assert.strictEqual(pool.live, 7);
+  const ids = [];
+  for (let i = 0; i < pool.live; i++) ids.push(pool.at(i).id);
+  assert.strictEqual(new Set(ids).size, 7, 'no duplicates after a swap-remove');
+  assert.ok(!ids.includes(3), 'the released item is gone');
+});
+
+test('obtain returns null at the ceiling instead of growing', () => {
+  const pool = new GG.Pool(() => ({}), null, 3);
+  assert.ok(pool.obtain() && pool.obtain() && pool.obtain());
+  assert.strictEqual(pool.obtain(), null);
+  assert.strictEqual(pool.live, 3);
+});
+
+test('a reverse sweep releases exactly the matching items', () => {
+  const pool = new GG.Pool(() => ({ n: 0 }), null, 32);
+  for (let i = 0; i < 20; i++) pool.obtain().n = i;
+  pool.sweep((item) => item.n % 2 === 0);
+  assert.strictEqual(pool.live, 10);
+  for (let i = 0; i < pool.live; i++) {
+    assert.strictEqual(pool.at(i).n % 2, 1, 'only odd items survived');
+  }
+});
+
+test('recycled objects are reused, not reallocated', () => {
+  const pool = new GG.Pool(() => ({}), null, 4);
+  const a = pool.obtain();
+  pool.releaseAt(0);
+  const b = pool.obtain();
+  assert.strictEqual(a, b, 'the same object came back');
+});
+
+/* ---- paths ---------------------------------------------------------------------- */
+
+section('enemy paths');
+
+test('every template is samplable across its whole range', () => {
+  for (const name of GG.paths.NAMES) {
+    const p = new GG.paths.Path(name, { phase: 0.4 });
+    const out = { x: 0, y: 0, angle: 0 };
+    for (let t = 0; t <= 1.0001; t += 0.02) {
+      p.sample(t, 450, 850, out);
+      assert.ok(Number.isFinite(out.x) && Number.isFinite(out.y) && Number.isFinite(out.angle),
+        `${name} produced a non-finite sample at t=${t.toFixed(2)}`);
     }
   }
 });
 
-test('a spawned sector always has travel left before reaching the marker', () => {
-  const config = freshConfig();
-  const clear = G.degToRad(config.rules.spawnClearDeg);
-  for (const direction of [1, -1]) {
-    for (let seed = 1; seed <= 150; seed++) {
-      const ring = new Ring(config, createRng(seed));
-      ring.reset();
-      ring.direction = direction;
-      const ringAngle = (seed / 150) * TAU;
-      ring.sectors = [];
-      ring.spawn('yellow', ringAngle);
-      const s = ring.sectors[0];
-      const A = G.norm(ringAngle + s.start);
-      /* clockwise: the far edge arrives; anticlockwise: the near edge does */
-      const travel = direction > 0 ? TAU - (A + s.span) : A;
-      assert.ok(travel >= clear, 'no lead time, dir ' + direction + ' seed ' + seed +
-        ' travel=' + travel.toFixed(3));
+test('paths stay within a sane band of the playfield', () => {
+  /* Off-screen staging room is fine; a path that wanders ten screens away is
+   * not, because the enemy would never be retired. */
+  for (const name of GG.paths.NAMES) {
+    const p = new GG.paths.Path(name, {});
+    const out = { x: 0, y: 0, angle: 0 };
+    for (let t = 0; t <= 1.0001; t += 0.02) {
+      p.sample(t, 450, 850, out);
+      assert.ok(out.x > -450 && out.x < 900, `${name} x=${out.x.toFixed(0)} at t=${t.toFixed(2)}`);
+      assert.ok(out.y > -450 && out.y < 1300, `${name} y=${out.y.toFixed(0)} at t=${t.toFixed(2)}`);
     }
   }
 });
 
-test('freeIntervals merges overlapping and wrapping blocked runs', () => {
-  /* Padding sectors by a minimum gap makes neighbouring blocked intervals
-   * overlap. Treating them as disjoint invents free space across a sector. */
-  const overlapping = [{ start: 0, span: 2 }, { start: 1, span: 2 }];
-  const free = G.freeIntervals(overlapping);
-  assert.strictEqual(free.length, 1, 'expected one free run');
-  assert.ok(Math.abs(free[0].start - 3) < 1e-6, 'free run starts at the merged end');
-  assert.ok(Math.abs(free[0].span - (TAU - 3)) < 1e-6, 'free run covers the rest');
-
-  /* Nothing reported as free may overlap anything reported as blocked. */
-  const blocked = [{ start: 6.0, span: 1.5 }, { start: 0.5, span: 1.0 }, { start: 1.2, span: 1.0 }];
-  G.freeIntervals(blocked).forEach(f => {
-    blocked.forEach(b => {
-      assert.ok(!G.arcsOverlap(f.start, f.span, G.norm(b.start), b.span),
-        'a free run overlapped a blocked run');
-    });
-  });
-
-  /* Fully blocked leaves nothing. */
-  assert.strictEqual(G.freeIntervals([{ start: 0, span: TAU }]).length, 0);
-});
-
-test('sectors never come closer than the minimum gap during a live run', () => {
-  const config = freshConfig();
-  const minGap = G.degToRad(config.rules.minGapDeg);
-  let worst = Infinity;
-  let violations = 0;
-  let overlaps = 0;
-
-  for (let seed = 1; seed <= 12; seed++) {
-    const game = startPlaying(newGame({}, seed), seed);
-    while (game.state === 'playing' && game.lastNowCursor < 25000) {
-      run(game, 16);
-      if (game.ring.hitTest(game.ringAngle)) {
-        game.lastPressAt = -Infinity;
-        game.press(game.lastNowCursor);
-      }
-      const visible = game.ring.sectors.filter(s => s.phase !== 'out');
-      for (const a of visible) {
-        for (const b of visible) {
-          if (a === b) continue;
-          const A = G.norm(game.ringAngle + a.start);
-          const B = G.norm(game.ringAngle + b.start);
-          if (G.arcsOverlap(A, a.span, B, b.span)) overlaps++;
-          const gap = G.cwDelta(G.norm(A + a.span), B);
-          if (gap < worst) worst = gap;
-          if (gap < minGap - 1e-6) violations++;
-        }
-      }
-    }
+test('mirroring is a true horizontal reflection', () => {
+  const a = new GG.paths.Path('hookLeft', {});
+  const b = new GG.paths.Path('hookLeft', { mirror: true });
+  const oa = { x: 0, y: 0, angle: 0 };
+  const ob = { x: 0, y: 0, angle: 0 };
+  for (let t = 0; t <= 1.0001; t += 0.05) {
+    a.sample(t, 450, 850, oa);
+    b.sample(t, 450, 850, ob);
+    assert.ok(Math.abs((450 - oa.x) - ob.x) < 1e-6, `t=${t}: ${450 - oa.x} vs ${ob.x}`);
+    assert.ok(Math.abs(oa.y - ob.y) < 1e-6, 'mirroring must not move it vertically');
   }
-  assert.strictEqual(overlaps, 0, 'sectors overlapped');
-  assert.strictEqual(violations, 0,
-    violations + ' gaps below the minimum; smallest was ' + G.radToDeg(worst).toFixed(1) + ' deg');
 });
 
-test('a sector is not judgeable while it is fading in or out', () => {
-  const game = startPlaying(newGame());
-  const ring = game.ring;
-  ring.sectors = [];
-  ring.direction = 1;
-  ring.spawn('green', game.ringAngle);
-  const s = ring.sectors[0];
-  s.start = G.norm(-s.span / 2 - game.ringAngle);   /* park it on the marker */
-  assert.strictEqual(s.phase, 'in');
-  assert.strictEqual(ring.hitTest(game.ringAngle), null, 'a fading-in sector was hit');
-  s.phase = 'live';
-  assert.strictEqual(ring.hitTest(game.ringAngle), s, 'a live sector was missed');
-  s.phase = 'out';
-  assert.strictEqual(ring.hitTest(game.ringAngle), null, 'a fading-out sector was hit');
+test('a descending path reports a downward heading', () => {
+  /* Sprites are authored nose-up, so a craft flying straight down must draw
+   * near PI. Anything else would render the fleet upside down. */
+  const p = new GG.paths.Path('lane', {});
+  const out = { x: 0, y: 0, angle: 0 };
+  p.sample(0.5, 450, 850, out);
+  assert.ok(Math.abs(M.angleDelta(out.angle, Math.PI)) < 0.25,
+    `expected ~PI, got ${out.angle.toFixed(3)}`);
 });
 
-/* ------------------------------------------------------------- scoring --- */
+test('an unknown template falls back rather than throwing', () => {
+  const p = new GG.paths.Path('no-such-path', {});
+  assert.strictEqual(p.name, 'lane');
+});
 
-section('Scoring, lives and input');
+/* ---- bullet patterns -------------------------------------------------------------- */
 
-function aim(game, type) {
-  const s = game.ring.sectors.find(x => x.id === type && x.phase === 'live');
-  assert.ok(s, 'no live ' + type + ' sector');
-  game.ringAngle = G.norm(-s.span / 2 - s.start);
-  return s;
+section('bullet patterns');
+
+/* A stand-in world that records what a pattern fires. */
+function fakeWorld(config, overrides) {
+  const world = Object.assign({
+    config,
+    worldW: 450,
+    worldH: 850,
+    rng: GG.createRng(12345),
+    player: { x: 225, y: 660 },
+    shots: [],
+    spawnEnemyBullet(x, y, vx, vy, kind) {
+      const b = { x, y, vx, vy, kind };
+      world.shots.push(b);
+      return b;
+    }
+  }, overrides);
+  return world;
 }
 
-test('each colour awards its configured points', () => {
-  const expected = { yellow: 1, blue: 2, green: 5 };
-  for (const [type, points] of Object.entries(expected)) {
-    const game = startPlaying(newGame());
-    aim(game, type);
-    game.lastPressAt = -Infinity;
-    const before = game.score;
-    const result = game.press(game.lastNowCursor);
-    assert.strictEqual(result.type, 'hit', type + ' was not a hit');
-    assert.strictEqual(result.points, points, type + ' points');
-    assert.strictEqual(game.score, before + points);
-  }
-});
-
-test('one press gives exactly one outcome; duplicates are swallowed', () => {
-  const game = startPlaying(newGame());
-  aim(game, 'yellow');
-  game.lastPressAt = -Infinity;
-  const t = game.lastNowCursor;
-  const first = game.press(t);
-  assert.strictEqual(first.type, 'hit');
-  /* a duplicated pointer/click pair arriving in the same instant */
-  const second = game.press(t);
-  assert.strictEqual(second.type, 'duplicate');
-  assert.strictEqual(game.score, first.points, 'duplicate press scored again');
-  const judged = game.events.filter(e => ['hit', 'heal', 'miss'].includes(e.type));
-  assert.strictEqual(judged.length, 1, 'more than one outcome emitted');
-});
-
-test('a sector cannot be farmed during a single pass', () => {
-  const game = startPlaying(newGame({ reverseOnPress: false }));
-  const sector = aim(game, 'yellow');
-  game.lastPressAt = -Infinity;
-  const first = game.press(game.lastNowCursor);
-  assert.strictEqual(first.type, 'hit');
-  assert.strictEqual(sector.phase, 'out', 'struck sector stayed judgeable');
-
-  /* Hammer the same spot for a second without letting the ring move on. */
-  let extra = 0;
-  for (let i = 0; i < 20; i++) {
-    game.lastPressAt = -Infinity;
-    const r = game.press(game.lastNowCursor);
-    if (r.type === 'hit' && r.sector === 'yellow') extra++;
-  }
-  assert.strictEqual(extra, 0, 'the same pass scored ' + extra + ' extra times');
-});
-
-test('pressing a dark gap costs exactly one life and no score', () => {
-  const game = startPlaying(newGame());
-  game.ring.sectors = [];               /* nothing under the marker */
-  const before = { lives: game.lives, score: game.score };
-  game.lastPressAt = -Infinity;
-  const result = game.press(game.lastNowCursor);
-  assert.strictEqual(result.type, 'miss');
-  assert.strictEqual(result.cause, 'gap');
-  assert.strictEqual(game.lives, before.lives - 1);
-  assert.strictEqual(game.score, before.score, 'a miss changed the score');
-});
-
-test('hearts are capped, and orange still scores at full health', () => {
-  const game = startPlaying(newGame());
-  game.ring.sectors = [];
-  game.ring.direction = game.direction;
-  game.ring.spawn('orange', game.ringAngle);
-  const orange = game.ring.sectors[0];
-  orange.phase = 'live';
-  aim(game, 'orange');
-  assert.strictEqual(game.lives, 3, 'expected full health');
-  game.lastPressAt = -Infinity;
-  const result = game.press(game.lastNowCursor);
-  assert.strictEqual(result.type, 'heal');
-  assert.strictEqual(result.points, 3, 'orange scored nothing at full health');
-  assert.strictEqual(game.lives, 3, 'hearts went over the cap');
-  assert.strictEqual(result.healed, false);
-});
-
-test('orange restores exactly one heart when one is missing', () => {
-  const game = startPlaying(newGame());
-  game.lives = 1;
-  game.ring.sectors = [];
-  game.ring.direction = game.direction;
-  game.ring.spawn('orange', game.ringAngle);
-  game.ring.sectors[0].phase = 'live';
-  aim(game, 'orange');
-  game.lastPressAt = -Infinity;
-  const result = game.press(game.lastNowCursor);
-  assert.strictEqual(result.healed, true);
-  assert.strictEqual(game.lives, 2);
-});
-
-test('only one orange collectible exists at a time', () => {
-  const game = startPlaying(newGame({ heartSpawnChancePerSuccess: 1 }));
-  for (let i = 0; i < 60; i++) {
-    run(game, 120);
-    const live = game.ring.hitTest(game.ringAngle);
-    if (live) { game.lastPressAt = -Infinity; game.press(game.lastNowCursor); }
-    const oranges = game.ring.sectors.filter(s => s.id === 'orange' && s.phase !== 'out');
-    assert.ok(oranges.length <= 1, 'found ' + oranges.length + ' oranges');
-  }
-});
-
-test('every press re-rolls the sector widths', () => {
-  const game = startPlaying(newGame());
-  let pressesThatChanged = 0;
-  const total = 20;
-  for (let i = 0; i < total; i++) {
-    game.lives = 3;
-    const before = new Map(game.ring.sectors.filter(s => s.phase !== 'out').map(s => [s.uid, s.span]));
-    game.lastPressAt = -Infinity;
-    game.press(game.lastNowCursor);
-    const after = game.ring.sectors.filter(s => s.phase !== 'out');
-    const changed = after.some(s => before.has(s.uid) && Math.abs(before.get(s.uid) - s.span) > 1e-9);
-    if (changed) pressesThatChanged++;
-    run(game, 120);
-  }
-  assert.strictEqual(pressesThatChanged, total,
-    'only ' + pressesThatChanged + '/' + total + ' presses changed a width');
-});
-
-test('resizing keeps every width inside its colour range', () => {
+test('every pattern fires at least one projectile per volley', () => {
   const config = freshConfig();
-  const game = startPlaying(newGame());
-  const byId = {};
-  config.sectors.forEach(a => { byId[a.id] = a; });
-  for (let i = 0; i < 60; i++) {
-    game.lives = 3;
-    game.lastPressAt = -Infinity;
-    game.press(game.lastNowCursor);
-    run(game, 100);
-    game.ring.sectors.filter(s => s.phase !== 'out').forEach(s => {
-      const arch = byId[s.id];
-      const maxDeg = arch.spanDeg + (arch.spanJitterDeg || 0);
-      /* Widths may be squeezed DOWN by a neighbour, never inflated. */
-      assert.ok(G.radToDeg(s.span) <= maxDeg + 1e-6,
-        s.id + ' grew to ' + G.radToDeg(s.span).toFixed(1) + ' deg, above its ' + maxDeg);
-      assert.ok(G.radToDeg(s.span) >= config.rules.minSpanDeg - 1e-6,
-        s.id + ' shrank below the floor');
-    });
-  }
-});
-
-test('a fading-in sector never sits on the marker, even across a reversal', () => {
-  /* A press reverses the ring, so a sector still fading in can have its
-   * trailing edge become the leading one. Placement must leave room on both
-   * sides or a target turns collidable right on the marker. */
-  let onMarker = 0;
-  let samples = 0;
-  for (let seed = 1; seed <= 10; seed++) {
-    const game = startPlaying(newGame({}, seed), seed);
-    while (game.state === 'playing' && game.lastNowCursor < 20000) {
-      run(game, 16);
-      if (game.ring.hitTest(game.ringAngle)) {
-        game.lastPressAt = -Infinity;
-        game.press(game.lastNowCursor);
-      }
-      game.ring.sectors.forEach(s => {
-        if (s.phase !== 'in') return;
-        samples++;
-        const abs = G.norm(game.ringAngle + s.start);
-        if (G.arcContains(abs, s.span, 0)) onMarker++;
-      });
+  for (const name of Object.keys(GG.patterns.PATTERNS)) {
+    const pattern = GG.patterns.PATTERNS[name];
+    const world = fakeWorld(config);
+    const source = { x: 225, y: 200, spinPhase: 0.3 };
+    for (let v = 0; v < (pattern.volleys || 1); v++) pattern.fire(world, source, v);
+    assert.ok(world.shots.length > 0, `${name} fired nothing`);
+    for (const s of world.shots) {
+      assert.ok(Number.isFinite(s.vx) && Number.isFinite(s.vy), `${name} produced a NaN velocity`);
+      assert.ok(Math.hypot(s.vx, s.vy) > 1, `${name} produced a stationary bullet`);
     }
   }
-  assert.ok(samples > 500, 'not enough fading-in samples: ' + samples);
-  assert.strictEqual(onMarker, 0, onMarker + ' fading-in sectors were on the marker');
 });
 
-test('every press flips the direction of rotation', () => {
-  const game = startPlaying(newGame());
-  const seen = [game.direction];
+test('the green wall always leaves a dodgeable gap', () => {
+  const config = freshConfig();
+  /* Re-roll many times: the gap position is random, its existence is not. */
+  for (let seed = 0; seed < 60; seed++) {
+    const world = fakeWorld(config, { rng: GG.createRng(seed) });
+    GG.patterns.PATTERNS.greenWall.fire(world, { x: 225, y: 120 }, 0);
+    const xs = world.shots.map((s) => s.x).sort((a, b) => a - b);
+    let widest = Math.max(xs[0], world.worldW - xs[xs.length - 1]);
+    for (let i = 1; i < xs.length; i++) widest = Math.max(widest, xs[i] - xs[i - 1]);
+    assert.ok(widest >= GG.patterns.MIN_GAP,
+      `seed ${seed}: widest gap was ${widest.toFixed(1)}, need ${GG.patterns.MIN_GAP}`);
+  }
+});
+
+test('column spacing is at least the minimum gap', () => {
+  const config = freshConfig();
+  const world = fakeWorld(config);
+  GG.patterns.PATTERNS.columns.fire(world, { x: 225, y: 120 }, 0);
+  const xs = world.shots.map((s) => s.x).sort((a, b) => a - b);
+  for (let i = 1; i < xs.length; i++) {
+    assert.ok(xs[i] - xs[i - 1] >= GG.patterns.MIN_GAP,
+      `columns ${xs[i - 1]} and ${xs[i]} are too close together`);
+  }
+});
+
+test('aimed fire actually points at the player', () => {
+  const config = freshConfig();
+  const world = fakeWorld(config, { player: { x: 100, y: 700 } });
+  const source = { x: 300, y: 150 };
+  GG.patterns.PATTERNS.aimed.fire(world, source, 0);
+  const s = world.shots[0];
+  const wantAngle = Math.atan2(100 - 300, 700 - 150);
+  const gotAngle = Math.atan2(s.vx, s.vy);
+  assert.ok(Math.abs(M.angleDelta(wantAngle, gotAngle)) < 1e-6);
+});
+
+test('dense patterns are telegraphed', () => {
+  /* The rule from the brief: anything that fills the screen warns first. */
+  const dense = ['spread5', 'columns', 'fanAlt', 'greenWall', 'curvePair',
+                 'bossFan', 'bossRadial', 'bossAimedRake', 'bossMissiles'];
+  for (const name of dense) {
+    assert.ok(GG.patterns.PATTERNS[name].telegraph === true, `${name} is not telegraphed`);
+  }
+});
+
+/* ---- weapons ----------------------------------------------------------------------- */
+
+section('weapon ladder');
+
+test('every tier is visibly different from the one below it', () => {
+  /* The brief forbids invisible damage-only upgrades, so assert that each
+   * step changes the port list, the bolt sprite or the cadence. */
+  const tiers = GG.CONFIG.weapons.tiers;
+  for (let i = 1; i < tiers.length; i++) {
+    const a = tiers[i - 1];
+    const b = tiers[i];
+    const changed =
+      a.ports.length !== b.ports.length ||
+      a.bolt !== b.bolt ||
+      a.intervalMs !== b.intervalMs ||
+      a.muzzle !== b.muzzle ||
+      JSON.stringify(a.ports) !== JSON.stringify(b.ports);
+    assert.ok(changed, `tier ${i + 1} is indistinguishable from tier ${i}`);
+  }
+});
+
+test('projectile count never decreases up the ladder', () => {
+  const tiers = GG.CONFIG.weapons.tiers;
+  for (let i = 1; i < tiers.length; i++) {
+    assert.ok(tiers[i].ports.length >= tiers[i - 1].ports.length,
+      `tier ${i + 1} fires fewer projectiles than tier ${i}`);
+  }
+});
+
+test('cadence never gets slower up the ladder', () => {
+  const tiers = GG.CONFIG.weapons.tiers;
+  for (let i = 1; i < tiers.length; i++) {
+    assert.ok(tiers[i].intervalMs <= tiers[i - 1].intervalMs,
+      `tier ${i + 1} is slower than tier ${i}`);
+  }
+});
+
+test('the top tier adds a secondary fire mode', () => {
+  const top = GG.CONFIG.weapons.tiers[GG.CONFIG.weapons.maxTier - 1];
+  assert.ok(top.lanceEveryMs > 0, 'tier 6 has no centre lance');
+});
+
+test('upgrading caps out and reports it', () => {
+  const w = new GG.Weapons(freshConfig());
+  for (let i = 1; i < GG.CONFIG.weapons.maxTier; i++) {
+    assert.strictEqual(w.upgradeMain(), 'WEAPON UPGRADE');
+  }
+  assert.strictEqual(w.tier, GG.CONFIG.weapons.maxTier);
+  assert.strictEqual(w.upgradeMain(), null, 'a capped upgrade must report null');
+});
+
+test('module upgrades walk every module before reporting max', () => {
+  const config = freshConfig();
+  const w = new GG.Weapons(config);
+  const seen = new Set();
+  for (let i = 0; i < 200; i++) {
+    const label = w.upgradeModule();
+    if (label === null) break;
+    seen.add(w.moduleName());
+  }
+  assert.strictEqual(seen.size, config.weapons.moduleOrder.length,
+    'not every secondary module is reachable in a run');
+  assert.strictEqual(w.upgradeModule(), null);
+});
+
+test('every named module has a spec', () => {
+  for (const name of GG.CONFIG.weapons.moduleOrder) {
+    const spec = GG.CONFIG.weapons.modules[name];
+    assert.ok(spec, `module ${name} has no spec`);
+    assert.ok(spec.intervalMs > 0, `module ${name} would fire every frame`);
+    assert.ok(spec.label, `module ${name} has no banner label`);
+  }
+});
+
+/* ---- player ------------------------------------------------------------------------- */
+
+section('player');
+
+test('the hitbox is much smaller than the art', () => {
+  const p = GG.CONFIG.player;
+  assert.ok(p.hitRadius * 2 < p.spriteWidth * 0.35,
+    'the hitbox must be the cockpit, not the wingspan');
+});
+
+test('the ship stays inside its bounds under any input', () => {
+  const config = freshConfig();
+  const player = new GG.Player(config);
+  player.enter(450, 850);
+  player.spawnInMs = 0;
+  const b = player.bounds(450, 850);
+  const targets = [
+    { x: -9999, y: -9999 }, { x: 9999, y: 9999 },
+    { x: 225, y: 0 }, { x: 225, y: 100000 }
+  ];
+  for (const t of targets) {
+    for (let i = 0; i < 200; i++) {
+      player.update(16.667, { x: t.x, y: t.y, offsetY: 0 }, 450, 850);
+    }
+    assert.ok(player.x >= b.minX - 1e-6 && player.x <= b.maxX + 1e-6, `x=${player.x}`);
+    assert.ok(player.y >= b.minY - 1e-6 && player.y <= b.maxY + 1e-6, `y=${player.y}`);
+  }
+});
+
+test('vertical freedom matches the brief', () => {
+  const config = freshConfig();
+  const player = new GG.Player(config);
+  const b = player.bounds(450, 850);
+  const freedom = (b.maxY - b.minY) / 850;
+  assert.ok(freedom > 0.5 && freedom < 0.62,
+    `the ship should roam roughly the lower 55-60%, got ${(freedom * 100).toFixed(1)}%`);
+});
+
+test('a hit is ignored while already invulnerable', () => {
+  const config = freshConfig();
+  const player = new GG.Player(config);
+  player.enter(450, 850);
+  player.spawnInMs = 0;
+  player.invulnMs = 0;
+  const lives = player.lives;
+  assert.strictEqual(player.damage(), 'hit');
+  assert.strictEqual(player.lives, lives - 1);
+  assert.strictEqual(player.damage(), 'none', 'a second hit must not stack');
+  assert.strictEqual(player.lives, lives - 1);
+});
+
+test('a shield absorbs exactly one hit', () => {
+  const config = freshConfig();
+  const player = new GG.Player(config);
+  player.enter(450, 850);
+  player.spawnInMs = 0;
+  player.invulnMs = 0;
+  player.shield = 1;
+  const lives = player.lives;
+  assert.strictEqual(player.damage(), 'shield');
+  assert.strictEqual(player.lives, lives, 'a shielded hit must not cost a life');
+  assert.strictEqual(player.shield, 0);
+});
+
+test('the run ends exactly once at zero lives', () => {
+  const config = freshConfig({ player: { startLives: 2 } });
+  const player = new GG.Player(config);
+  player.enter(450, 850);
+  player.spawnInMs = 0;
+  const results = [];
   for (let i = 0; i < 6; i++) {
-    game.lives = 3;              /* keep the run alive; gap presses would end it */
-    game.lastPressAt = -Infinity;
-    game.press(game.lastNowCursor);
-    seen.push(game.direction);
-    assert.strictEqual(game.ring.direction, game.direction, 'ring direction out of step');
+    player.invulnMs = 0;
+    player.respawnMs = 0;
+    results.push(player.damage());
   }
-  for (let i = 1; i < seen.length; i++) {
-    assert.strictEqual(seen[i], -seen[i - 1], 'direction did not alternate: ' + seen.join(','));
+  assert.strictEqual(results.filter((r) => r === 'dead').length, 1, results.join(','));
+});
+
+/* ---- stage flow ----------------------------------------------------------------------- */
+
+section('stage flow');
+
+test('stage beats are in order and inside the stage', () => {
+  let previous = -1;
+  for (const beat of GG.STAGE_BEATS) {
+    assert.ok(beat.at >= previous, 'beats must be sorted by time');
+    assert.ok(beat.at >= 0 && beat.at < 1, `beat at ${beat.at} is outside the stage`);
+    previous = beat.at;
   }
 });
 
-test('direction reversal actually reverses travel', () => {
-  const game = startPlaying(newGame());
-  const a0 = game.ringAngle;
-  run(game, 100);
-  const forward = G.shortestDelta(a0, game.ringAngle);
-  game.lastPressAt = -Infinity;
-  game.press(game.lastNowCursor);
-  const a1 = game.ringAngle;
-  run(game, 100);
-  const backward = G.shortestDelta(a1, game.ringAngle);
-  assert.ok(forward > 0 && backward < 0, 'forward=' + forward + ' backward=' + backward);
+test('every beat names a real archetype and a real path', () => {
+  for (const beat of GG.STAGE_BEATS) {
+    assert.ok(GG.CONFIG.enemies[beat.group.type], `unknown enemy "${beat.group.type}"`);
+    assert.ok(GG.paths.TEMPLATES[beat.group.path], `unknown path "${beat.group.path}"`);
+  }
 });
 
-/* --------------------------------------------------------------- timer --- */
-
-section('Countdown timer');
-
-test('the timer costs one life on expiry and restarts cleanly', () => {
-  const game = startPlaying(newGame());
-  game.ring.sectors = [];
-  run(game, 6200);
-  const timeouts = game.events.filter(e => e.type === 'miss' && e.cause === 'timeout');
-  assert.strictEqual(timeouts.length, 1, 'expected 1 timeout, saw ' + timeouts.length);
-  assert.strictEqual(game.lives, 2);
-  assert.ok(game.timerFraction() > 0.8, 'the interval did not restart');
+test('every archetype names a real pattern', () => {
+  for (const key of Object.keys(GG.CONFIG.enemies)) {
+    const def = GG.CONFIG.enemies[key];
+    if (!def.pattern) continue;
+    assert.ok(GG.patterns.get(def.pattern), `enemy ${key} names unknown pattern "${def.pattern}"`);
+  }
 });
 
-test('one long frame cannot charge two timeouts', () => {
-  const game = startPlaying(newGame());
-  game.ring.sectors = [];
-  game.resetTimer();            /* start the interval from a known point */
-  run(game, 5950);
-  assert.strictEqual(game.lives, 3, 'expired early');
-  /* a single 240ms hitch straddling the expiry */
-  game.lastNowCursor += 240;
-  game.advanceTo(game.lastNowCursor);
-  assert.strictEqual(game.lives, 2, 'a single hitch cost ' + (3 - game.lives) + ' lives');
+test('no stretch of the stage is left empty for long', () => {
+  /* Beats must not leave a hole bigger than a few seconds; the filler rule
+   * covers the rest, but the authored timeline should not depend on it. */
+  const length = GG.CONFIG.stage.lengthMs;
+  let previous = 0;
+  for (const beat of GG.STAGE_BEATS) {
+    const gap = (beat.at - previous) * length;
+    assert.ok(gap <= 5000, `a ${Math.round(gap)} ms hole before the beat at ${beat.at}`);
+    previous = beat.at;
+  }
 });
 
-test('a hit resets the interval', () => {
-  const game = startPlaying(newGame());
-  run(game, 4000);
-  assert.ok(game.timerFraction() < 0.5);
-  aim(game, 'blue');
-  game.lastPressAt = -Infinity;
-  game.press(game.lastNowCursor);
-  assert.ok(game.timerFraction() > 0.99, 'the interval did not reset on a hit');
+test('the timeline promises a weapon drop in the heavy phase', () => {
+  const drop = GG.STAGE_BEATS.filter((b) => b.drop === 'weapon');
+  assert.strictEqual(drop.length, 1, 'exactly one guaranteed weapon drop per stage');
+  assert.ok(drop[0].at > 0.4 && drop[0].at < 0.7,
+    `the guaranteed drop should land in the heavy phase, not at ${drop[0].at}`);
 });
 
-test('decorative mode never charges a timeout', () => {
-  const game = startPlaying(newGame({ timerMode: 'decorative' }));
-  game.ring.sectors = [];
-  run(game, 20000);
-  assert.strictEqual(game.lives, 3, 'decorative mode still cost lives');
+test('the elite phase arrives before the climax', () => {
+  const elite = GG.STAGE_BEATS.find((b) => GG.CONFIG.enemies[b.group.type].elite);
+  assert.ok(elite, 'no elite is ever scheduled');
+  assert.ok(elite.at >= 0.65 && elite.at <= 0.8, `elite lands at ${elite.at}`);
 });
 
-/* ------------------------------------------------------- pause / hidden --- */
+test('a group never exceeds the on-screen enemy budget', () => {
+  for (const beat of GG.STAGE_BEATS) {
+    assert.ok((beat.group.count || 1) <= GG.CONFIG.stage.maxEnemies,
+      `a single group of ${beat.group.count} exceeds the budget`);
+  }
+});
 
-section('Pause, hidden tabs and the simulation clock');
+/* ---- full-run integration -------------------------------------------------------------
+ * The simulation has no DOM dependency, so a whole run can be driven here at a
+ * fixed timestep. These are the tests that actually protect the feel: dead
+ * air, pool ceilings and numerical stability over a long run. */
 
-test('pausing freezes the timer, the angle and the clock', () => {
-  const game = startPlaying(newGame());
-  run(game, 1500);
-  const frozen = {
-    timer: game.timerLeft, angle: game.ringAngle, sim: game.simTime
+section('full run');
+
+/* Drives `seconds` of simulated play at a fixed 60 Hz.
+ * `sloppy` adds a reaction delay and aim error, approximating a person. */
+function runSoak(options) {
+  options = options || {};
+  const config = freshConfig(options.config);
+  const fx = new GG.Effects(config);
+  fx.applyQuality('high');
+  const audio = { play() {}, startMusic() {}, stopMusic() {}, duckMusic() {}, suspendGameplay() {} };
+  const world = new GG.World(config, { fx, audio, onEvent: options.onEvent || (() => {}) });
+  world.setViewport(450, 974);
+  world.start(0, { seed: options.seed === undefined ? 20260919 : options.seed });
+
+  const DT = 1000 / 60;
+  const stats = {
+    longestQuietMs: 0, quietByPhase: {}, maxEnemies: 0, maxEnemyBullets: 0,
+    maxPlayerBullets: 0, maxParticles: 0, maxPickups: 0, stagesReached: 1, frames: 0
   };
-  game.pause(game.lastNowCursor, 'manual');
-  assert.strictEqual(game.state, 'paused');
-  run(game, 9000);      /* far longer than the 6s interval */
-  assert.strictEqual(game.timerLeft, frozen.timer, 'the timer ran while paused');
-  assert.strictEqual(game.ringAngle, frozen.angle, 'the ring turned while paused');
-  assert.strictEqual(game.simTime, frozen.sim, 'the clock ran while paused');
-  assert.strictEqual(game.lives, 3, 'a life was lost while paused');
-});
+  let quiet = 0;
+  let aimX = 225;
+  let hold = 0;
 
-test('a press is ignored while paused', () => {
-  const game = startPlaying(newGame());
-  aim(game, 'yellow');
-  game.pause(game.lastNowCursor, 'manual');
-  game.lastPressAt = -Infinity;
-  const result = game.press(game.lastNowCursor);
-  assert.strictEqual(result.type, 'ignored');
-  assert.strictEqual(game.score, 0);
-});
-
-test('resuming goes back through the countdown, and input is dead until it ends', () => {
-  const game = startPlaying(newGame());
-  game.pause(game.lastNowCursor, 'manual');
-  game.resume(game.lastNowCursor);
-  assert.strictEqual(game.state, 'countdown');
-  game.lastPressAt = -Infinity;
-  assert.strictEqual(game.press(game.lastNowCursor).type, 'ignored');
-  run(game, 3200);
-  assert.strictEqual(game.state, 'playing');
-});
-
-test('a long hidden stretch cannot bank up timer penalties', () => {
-  const game = startPlaying(newGame());
-  game.ring.sectors = [];
-  /* the tab is suspended for 30s and hands back one enormous delta */
-  game.lastNowCursor += 30000;
-  game.advanceTo(game.lastNowCursor);
-  assert.ok(game.lives >= 2, 'a suspended tab cost ' + (3 - game.lives) + ' lives');
-});
-
-/* ----------------------------------------------------------- game over --- */
-
-section('Game over');
-
-test('the run ends exactly once, at zero lives', () => {
-  const game = startPlaying(newGame());
-  game.ring.sectors = [];
-  for (let i = 0; i < 8; i++) {
-    game.lastPressAt = -Infinity;
-    game.press(game.lastNowCursor);
-  }
-  const overs = game.events.filter(e => e.type === 'gameover');
-  assert.strictEqual(overs.length, 1, 'gameover fired ' + overs.length + ' times');
-  assert.strictEqual(game.lives, 0);
-  assert.strictEqual(game.state, 'gameover');
-});
-
-test('no further presses register after the run ends', () => {
-  const game = startPlaying(newGame());
-  game.ring.sectors = [];
-  for (let i = 0; i < 4; i++) { game.lastPressAt = -Infinity; game.press(game.lastNowCursor); }
-  const finalScore = game.score;
-  game.lastPressAt = -Infinity;
-  assert.strictEqual(game.press(game.lastNowCursor).type, 'ignored');
-  assert.strictEqual(game.score, finalScore);
-});
-
-test('practice never ends the run or spends a heart', () => {
-  const game = newGame();
-  game.lastNowCursor = 0;
-  game.start(0, { practice: true, seed: 5 });
-  run(game, 3300);
-  game.ring.sectors = [];
-  for (let i = 0; i < 10; i++) { game.lastPressAt = -Infinity; game.press(game.lastNowCursor); }
-  run(game, 14000);
-  assert.strictEqual(game.lives, 3, 'practice cost a heart');
-  assert.strictEqual(game.state, 'playing', 'practice ended the run');
-});
-
-/* ------------------------------------------------------------- restart --- */
-
-section('Restart and determinism');
-
-test('restart clears score, lives, timer, targets and latches', () => {
-  const game = startPlaying(newGame());
-  aim(game, 'green');
-  game.lastPressAt = -Infinity;
-  game.press(game.lastNowCursor);
-  game.lives = 1;
-  assert.ok(game.score > 0);
-
-  game.start(game.lastNowCursor, { seed: 77 });
-  run(game, 3300);
-  assert.strictEqual(game.score, 0);
-  assert.strictEqual(game.lives, 3);
-  assert.strictEqual(game.direction, 1, 'direction survived a restart');
-  assert.ok(game.timerFraction() > 0.9, 'timer not refilled: ' + game.timerFraction());
-  assert.strictEqual(game.gameOverEmitted, false);
-  assert.strictEqual(game.ring.pending.length, 0, 'a pending spawn survived a restart');
-});
-
-test('the same seed reproduces the same run', () => {
-  const play = (seed) => {
-    const game = newGame({}, seed);
-    game.lastNowCursor = 0;
-    game.start(0, { seed });
-    run(game, 3300);
-    for (let i = 0; i < 120; i++) {
-      run(game, 48);
-      if (game.ring.hitTest(game.ringAngle)) {
-        game.lastPressAt = -Infinity;
-        game.press(game.lastNowCursor);
-      }
+  for (let i = 0; i < 60 * (options.seconds || 120); i++) {
+    hold -= DT;
+    if (hold <= 0) {
+      hold = options.sloppy ? 200 : DT;
+      const t = world.enemies.nearest(world.player.x, world.player.y - 220, 900, null);
+      aimX = (t ? t.x : 225) + (options.sloppy ? ((i * 37) % 70) - 35 : 0);
     }
-    return { score: game.score, lives: game.lives, angle: game.ringAngle.toFixed(9) };
-  };
-  assert.deepStrictEqual(play(2024), play(2024), 'the same seed diverged');
-  assert.notDeepStrictEqual(play(2024), play(9999), 'different seeds matched');
-});
+    world.input = { x: aimX, y: 974 * (0.76 + Math.sin(i / 95) * 0.06), offsetY: 0 };
+    world.step(DT);
+    fx.update(DT);
+    if (!options.mortal) world.player.lives = 999;   // measure pacing, not survival
 
-test('speed ramps smoothly and respects the cap', () => {
-  const game = startPlaying(newGame());
-  const rules = game.rules();
-  assert.ok(Math.abs(game.speed - rules.speedStartRadPerSec) < 0.05);
-  game.score = 10000;                         /* far past the cap */
-  let previous = game.speed;
-  let biggestStep = 0;
-  for (let i = 0; i < 400; i++) {
-    run(game, 16);
-    biggestStep = Math.max(biggestStep, Math.abs(game.speed - previous));
-    previous = game.speed;
-  }
-  assert.ok(game.speed <= rules.speedMaxRadPerSec + 1e-9, 'speed passed the cap');
-  assert.ok(game.speed > rules.speedMaxRadPerSec - 0.02, 'speed never reached the cap');
-  /* Expressed against the configured range so the bound stays meaningful if
-   * the speeds are retuned: one frame may never cover more than 5% of the
-   * whole start-to-cap ramp, which is far below what reads as a jump. */
-  const range = rules.speedMaxRadPerSec - rules.speedStartRadPerSec;
-  assert.ok(biggestStep < range * 0.05,
-    'speed stepped by ' + biggestStep.toFixed(3) + ' in one frame (' +
-    (100 * biggestStep / range).toFixed(1) + '% of the ramp)');
-});
-
-test('a full bot run stays consistent: score matches the awards', () => {
-  const game = startPlaying(newGame({}, 4242), 4242);
-  let expected = 0;
-  game.onEvent = (type, payload) => {
-    if (type === 'hit' || type === 'heal') expected += payload.points;
-  };
-  for (let i = 0; i < 4000 && game.state === 'playing'; i++) {
-    run(game, 16);
-    if (game.ring.hitTest(game.ringAngle)) {
-      game.lastPressAt = -Infinity;
-      game.press(game.lastNowCursor);
+    const busy = world.enemies.count > 0 || world.boss.active();
+    if (busy) quiet = 0;
+    else {
+      quiet += DT;
+      const phase = world.director.phase;
+      if (quiet > stats.longestQuietMs) stats.longestQuietMs = quiet;
+      if (quiet > (stats.quietByPhase[phase] || 0)) stats.quietByPhase[phase] = quiet;
     }
+
+    stats.maxEnemies = Math.max(stats.maxEnemies, world.enemies.count);
+    stats.maxEnemyBullets = Math.max(stats.maxEnemyBullets, world.enemyBullets.live);
+    stats.maxPlayerBullets = Math.max(stats.maxPlayerBullets, world.playerBullets.live);
+    stats.maxParticles = Math.max(stats.maxParticles, fx.particles.live);
+    stats.maxPickups = Math.max(stats.maxPickups, world.pickups.count);
+    stats.stagesReached = Math.max(stats.stagesReached, world.director.stage + 1);
+    stats.frames++;
+    if (world.state !== 'playing') break;
   }
-  assert.strictEqual(game.score, expected, 'score drifted from the sum of awards');
-  assert.ok(game.score > 100, 'the bot barely scored: ' + game.score);
-});
-
-section('Configuration');
-
-test('config/game-config.json does not contradict the code defaults', () => {
-  /* The JSON is fetched and merged OVER src/config.js when the game is
-   * served, so a stale value here silently changes the shipped game. */
-  const json = JSON.parse(require('fs').readFileSync(__dirname + '/../config/game-config.json', 'utf8'));
-  const drift = [];
-  Object.keys(json.rules || {}).forEach(key => {
-    if (CONFIG.rules[key] === undefined) return;
-    if (json.rules[key] !== CONFIG.rules[key]) {
-      drift.push(key + ': json=' + json.rules[key] + ' code=' + CONFIG.rules[key]);
-    }
-  });
-  (json.sectors || []).forEach(entry => {
-    const arch = CONFIG.sectors.filter(s => s.id === entry.id)[0];
-    if (!arch) return;
-    ['spanDeg', 'spanJitterDeg', 'points'].forEach(f => {
-      if (entry[f] !== undefined && entry[f] !== arch[f]) {
-        drift.push(entry.id + '.' + f + ': json=' + entry[f] + ' code=' + arch[f]);
-      }
-    });
-  });
-  assert.strictEqual(drift.length, 0, 'config drift: ' + drift.join('; '));
-});
-
-/* ---------------------------------------------------------------- done --- */
-
-console.log('\n' + '-'.repeat(52));
-if (failures.length) {
-  console.log(passed + ' passed, ' + failures.length + ' FAILED');
-  failures.forEach(f => console.log('  * ' + f.name + ': ' + f.err.message));
-  process.exit(1);
+  return { world, fx, config, stats };
 }
-console.log(passed + ' passed, 0 failed');
+
+test('a full run never leaves the player with nothing to shoot', () => {
+  /* The headline pacing rule from the brief: "almost never more than ~0.5-0.8
+   * sec with nothing to shoot". This regressed once already, because the
+   * filler only ran during the stage phase and the boss warning and the
+   * stage-clear window were therefore silent. */
+  const { stats, config } = runSoak({ seconds: 240 });
+  const budget = config.stage.maxQuietMs + 1000 / 60 + 1;
+  assert.ok(stats.longestQuietMs <= budget,
+    `longest empty stretch was ${Math.round(stats.longestQuietMs)} ms, budget ${Math.round(budget)} ms ` +
+    `(by phase: ${JSON.stringify(stats.quietByPhase)})`);
+});
+
+test('the rule holds through the boss warning and the stage clear', () => {
+  const { stats, config } = runSoak({ seconds: 240 });
+  const budget = config.stage.maxQuietMs + 1000 / 60 + 1;
+  assert.ok(stats.stagesReached >= 2, 'the soak never reached a second stage');
+  for (const phase of Object.keys(stats.quietByPhase)) {
+    assert.ok(stats.quietByPhase[phase] <= budget,
+      `phase "${phase}" went quiet for ${Math.round(stats.quietByPhase[phase])} ms`);
+  }
+});
+
+test('a long run stays inside every performance budget', () => {
+  const { stats, config } = runSoak({ seconds: 300, sloppy: true });
+  assert.ok(stats.maxEnemies <= config.stage.maxEnemies,
+    `${stats.maxEnemies} enemies exceeds the ${config.stage.maxEnemies} budget`);
+  assert.ok(stats.maxEnemyBullets <= config.bullets.maxEnemy);
+  assert.ok(stats.maxPlayerBullets <= config.bullets.maxPlayer);
+  assert.ok(stats.maxParticles <= config.quality.high.particles);
+  /* Both projectile pools together must stay under the spec's 300 on screen. */
+  assert.ok(stats.maxEnemyBullets + stats.maxPlayerBullets <= 300,
+    `${stats.maxEnemyBullets + stats.maxPlayerBullets} projectiles exceeds the 300 budget`);
+});
+
+test('a long run keeps every quantity finite', () => {
+  const { world } = runSoak({ seconds: 240, sloppy: true });
+  const finite = (v) => Number.isFinite(v);
+  assert.ok(finite(world.score) && finite(world.player.x) && finite(world.player.y),
+    'a core quantity went non-finite');
+  for (let i = 0; i < world.enemyBullets.live; i++) {
+    const b = world.enemyBullets.at(i);
+    assert.ok(finite(b.x) && finite(b.y) && finite(b.angle), 'a bullet went non-finite');
+  }
+  for (let i = 0; i < world.enemies.count; i++) {
+    const e = world.enemies.pool.at(i);
+    assert.ok(finite(e.x) && finite(e.y) && finite(e.angle), 'an enemy went non-finite');
+  }
+});
+
+test('the run escalates: stages advance and bosses die', () => {
+  const seen = { boss: 0 };
+  const { world, stats } = runSoak({
+    seconds: 300,
+    onEvent: (type) => { if (type === 'boss-down') seen.boss++; }
+  });
+  assert.ok(stats.stagesReached >= 3,
+    `only reached stage ${stats.stagesReached} in 300 s`);
+  assert.ok(seen.boss >= 2, `only ${seen.boss} bosses were destroyed in 300 s`);
+  assert.ok(world.score > 20000, `score of ${world.score} is implausibly low`);
+});
+
+test('upgrades actually arrive during a run', () => {
+  /* The pity timer plus the drop weights have to keep the ladder climbing;
+   * a run that never upgrades is the failure mode the reference clip rules
+   * out most clearly. */
+  let pickups = 0;
+  const tiers = new Set();
+  const { world } = runSoak({
+    seconds: 180,
+    onEvent: (type) => { if (type === 'pickup') pickups++; }
+  });
+  tiers.add(world.weapons.tier);
+  assert.ok(pickups >= 8, `only ${pickups} pickups were collected in 180 s`);
+});
+
+test('a hit is survivable and the run ends when lives run out', () => {
+  const { world } = runSoak({ seconds: 300, sloppy: true, mortal: true });
+  assert.ok(world.state === 'gameover' || world.player.lives > 0,
+    'a mortal run neither survived nor ended cleanly');
+  if (world.state === 'gameover') {
+    const stats = world.stats();
+    assert.ok(stats.score >= 0 && Number.isFinite(stats.timeMs), 'game-over stats are malformed');
+    assert.strictEqual(world.player.lives, 0);
+  }
+});
+
+test('a paused world does not advance', () => {
+  const { world } = runSoak({ seconds: 20 });
+  world.pause(world.lastNow, 'test');
+  const before = { t: world.simTime, score: world.score, enemies: world.enemies.count };
+  world.advanceTo(world.lastNow + 5000);
+  assert.strictEqual(world.simTime, before.t, 'the clock advanced while paused');
+  assert.strictEqual(world.score, before.score);
+  assert.strictEqual(world.enemies.count, before.enemies);
+});
+
+test('a long stall is capped, not replayed', () => {
+  /* Resuming a backgrounded tab must not fast-forward the bullets through the
+   * player. */
+  const { world } = runSoak({ seconds: 20 });
+  world.state = 'playing';
+  world.lastNow = 0;
+  const advanced = world.advanceTo(30000);
+  assert.ok(advanced <= 201, `a 30 s stall advanced the simulation by ${advanced} ms`);
+});
+
+/* ---- results -------------------------------------------------------------------------- */
+
+console.log('\n' + passed + ' passed, ' + failures.length + ' failed');
+if (failures.length) {
+  console.log('\nFailures:');
+  failures.forEach((f) => console.log('  ' + f.name + '\n    ' + f.err.stack.split('\n')[0]));
+  process.exitCode = 1;
+}

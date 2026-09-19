@@ -2,66 +2,65 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
-<meta name="theme-color" content="#080909">
-<meta name="description" content="COLOR PULSE — a minimalist circular timing game.">
-<title>COLOR PULSE</title>
-<link rel="icon" href="assets/svg/heart-full.svg">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#04060f">
+<meta name="description" content="GALAXY GUNNER — a portrait arcade shooter.">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>GALAXY GUNNER</title>
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 
 <div id="app">
-  <canvas id="playfield" aria-label="Game playfield. Press space to strike the marker."></canvas>
+  <canvas id="playfield" aria-label="Game playfield. Drag to fly, space to fire a bomb."></canvas>
 
-  <!-- Gameplay controls. .no-strike keeps them from also hitting the ring. -->
-  <div id="hud-controls" class="no-strike">
+  <!-- Gameplay controls. .no-drag keeps them from also steering the ship. -->
+  <div id="hud-controls" class="no-drag">
     <button id="btn-fullscreen" class="icon-btn" type="button" aria-label="Enter full screen" aria-pressed="false" hidden>
-      <img id="fullscreen-icon" src="assets/svg/icon-fullscreen.svg" alt="" width="24" height="24">
+      <span id="fullscreen-icon" aria-hidden="true">&#9906;</span>
     </button>
     <button id="btn-pause" class="icon-btn" type="button" aria-label="Pause">
-      <img src="assets/svg/icon-pause.svg" alt="" width="24" height="24">
+      <span aria-hidden="true">&#10073;&#10073;</span>
     </button>
     <button id="btn-mute" class="icon-btn" type="button" aria-label="Mute sound" aria-pressed="false">
-      <img id="mute-icon" src="assets/svg/icon-sound.svg" alt="" width="24" height="24">
+      <span id="mute-icon" aria-hidden="true">&#9834;</span>
     </button>
   </div>
 
-  <button id="tap-button" class="no-strike" type="button">TAP</button>
-
-  <div id="countdown-overlay" aria-hidden="true"><span id="countdown-value"></span></div>
-
-  <div id="practice-banner" class="no-strike" hidden>
-    <p id="practice-text"></p>
-    <button id="practice-exit" class="text-btn" type="button">End practice</button>
-  </div>
+  <button id="btn-bomb" class="bomb-btn no-drag" type="button" aria-label="Use bomb" data-count="0">
+    <span aria-hidden="true">&#9679;</span>
+  </button>
 
   <!-- ------------------------------ screens ------------------------------ -->
 
   <section id="screen-loading" class="screen is-visible" aria-label="Loading">
     <div class="panel">
-      <p class="loading-text">Loading…</p>
+      <p id="loading-text" class="loading-text">Loading&hellip;</p>
     </div>
   </section>
 
   <section id="screen-menu" class="screen" hidden aria-label="Main menu">
-    <div class="panel">
-      <h1 class="title">COLOR<span>PULSE</span></h1>
-      <p class="tagline">Strike the colour under the marker.</p>
+    <div class="panel panel-scroll">
+      <h1 class="title">GALAXY<span>GUNNER</span></h1>
+      <p class="tagline">Shoot &middot; Upgrade &middot; Survive</p>
 
       <div class="best-line">Best <strong id="menu-best">0</strong></div>
 
       <div class="actions">
         <button id="btn-play" class="primary-btn" type="button">Play</button>
         <button id="btn-howto" class="secondary-btn" type="button">How to play</button>
-        <button id="btn-practice" class="secondary-btn" type="button">Practice</button>
       </div>
 
       <fieldset class="settings">
         <legend>Settings</legend>
         <label class="switch">
           <input type="checkbox" id="opt-sound" checked>
-          <span>Sound</span>
+          <span>Sound effects</span>
+        </label>
+        <label class="switch">
+          <input type="checkbox" id="opt-music" checked>
+          <span>Music</span>
         </label>
         <label class="switch">
           <input type="checkbox" id="opt-reduced-motion">
@@ -71,9 +70,14 @@
           <input type="checkbox" id="opt-reduced-flash">
           <span>Reduced flashing</span>
         </label>
-        <label class="switch">
-          <input type="checkbox" id="opt-decorative-timer">
-          <span>Inner ring decorative only</span>
+        <label class="select-row">
+          <span>Graphics</span>
+          <select id="opt-quality">
+            <option value="auto">Automatic</option>
+            <option value="high">High</option>
+            <option value="medium">Medium</option>
+            <option value="low">Low</option>
+          </select>
         </label>
       </fieldset>
 
@@ -81,38 +85,62 @@
     </div>
   </section>
 
+  <!-- Full-screen gate. A run does not start until the browser is actually in
+       full screen, because a phone address bar eats a third of a portrait
+       playfield. The only way past it without full screen is when the browser
+       genuinely cannot provide it (iOS Safari on iPhone has no element
+       full-screen API at all). -->
+  <section id="screen-fullscreen" class="screen" hidden aria-label="Full screen required">
+    <div class="panel">
+      <h2 id="gate-title">Full screen</h2>
+      <p class="gate-lead" id="gate-text">
+        Galaxy Gunner is played full screen, so the whole phone is playfield.
+      </p>
+      <div class="actions">
+        <button id="btn-gate-enter" class="primary-btn primary-btn-lg" type="button">
+          Tap to play full screen
+        </button>
+        <button id="btn-gate-skip" class="secondary-btn" type="button" hidden>
+          Play in the browser window
+        </button>
+        <button id="btn-gate-back" class="secondary-btn" type="button">Back</button>
+      </div>
+      <p class="note" id="gate-note" hidden></p>
+    </div>
+  </section>
+
   <section id="screen-howto" class="screen" hidden aria-label="How to play">
     <div class="panel panel-scroll">
       <h2>How to play</h2>
+
       <p class="howto-lead">
-        The thin white marker at twelve o&rsquo;clock never moves. The ring of colours
-        turns underneath it. Press once — tap the playfield, click, or use
-        <kbd>Space</kbd> — at the moment a colour is under the marker.
+        Drag anywhere on the lower part of the screen to fly. The ship rides
+        just above your finger so you can always see it. <b>Your guns fire by
+        themselves</b> — there is no fire button, and there is nothing to tap.
       </p>
 
-      <ul class="score-key">
-        <li><span class="chip" style="--chip:#FFDA00"></span> Yellow <b>+1</b></li>
-        <li><span class="chip" style="--chip:#2467F5"></span> Blue <b>+2</b></li>
-        <li><span class="chip chip-narrow" style="--chip:#19D538"></span> Green <b>+5</b> <em>narrow, hardest</em></li>
-        <li><span class="chip" style="--chip:#F56B08"></span> Orange <b>+3</b> <em>and restores a heart</em></li>
+      <ul class="key-list">
+        <li><span class="chip" style="--chip:#5dff7a"></span> <b>Weapon</b> — one more tier on the main gun, up to six</li>
+        <li><span class="chip" style="--chip:#ff9a2a"></span> <b>Missile</b> — unlocks and rotates your secondary module</li>
+        <li><span class="chip" style="--chip:#49d8ff"></span> <b>Shield</b> — absorbs one hit</li>
+        <li><span class="chip" style="--chip:#ffe14a"></span> <b>Rapid</b> — faster cadence for a while</li>
+        <li><span class="chip" style="--chip:#ffc23c"></span> <b>x2</b> — double score while it lasts</li>
+        <li><span class="chip" style="--chip:#ff5c7a"></span> <b>Magnet</b> — pickups come to you</li>
+        <li><span class="chip" style="--chip:#c86bff"></span> <b>Bomb</b> — clears the screen; tap the corner button or press <kbd>Space</kbd></li>
       </ul>
 
-      <p><b>Every press reverses the ring.</b> Each time you strike, the colours
-      start turning the other way — so the next target comes at you from the
-      opposite side.</p>
+      <p>Your hitbox is the cockpit, not the wingspan — far smaller than the
+      ship looks. Weave through the lanes rather than going around them.</p>
 
-      <p>Pressing over a dark gap costs a heart. So does letting the inner ring
-      run all the way down — you have <b id="howto-timer">6</b> seconds to land each strike.
-      Three hearts, and the run ends when the last one goes.</p>
+      <p>Taking a hit costs a life <b>and a weapon tier</b>, so the pickups are
+      worth chasing. A red glow around an enemy means a dense attack is about
+      to land.</p>
 
-      <p class="note">
-        Scoring values, the timer, spawn rates and the menus are reconstruction
-        defaults chosen for this build, not rules recovered from the original game.
-      </p>
+      <p class="note">Desktop: move the mouse or use <kbd>WASD</kbd> /
+      arrow keys. <kbd>Esc</kbd> or <kbd>P</kbd> pauses.</p>
 
       <div class="actions">
-        <button id="btn-howto-practice" class="primary-btn" type="button">Try practice</button>
-        <button id="btn-howto-back" class="secondary-btn" type="button">Back</button>
+        <button id="btn-howto-back" class="primary-btn" type="button">Back</button>
       </div>
     </div>
   </section>
@@ -129,17 +157,18 @@
     </div>
   </section>
 
-  <section id="screen-gameover" class="screen" hidden aria-label="Game over">
+  <section id="screen-gameover" class="screen" hidden aria-label="Run over">
     <div class="panel">
       <h2>Run over</h2>
       <p class="final-score" id="final-score">0</p>
       <p class="best-line">Best <strong id="gameover-best">0</strong></p>
       <p class="new-best" id="new-best" hidden>New best</p>
       <dl class="run-stats">
-        <div><dt>Hits</dt><dd id="stat-hits">0</dd></div>
-        <div><dt>Missed</dt><dd id="stat-misses">0</dd></div>
-        <div><dt>Timed out</dt><dd id="stat-timeouts">0</dd></div>
-        <div><dt>Hearts</dt><dd id="stat-hearts">0</dd></div>
+        <div><dt>Stage</dt><dd id="stat-stage">1</dd></div>
+        <div><dt>Kills</dt><dd id="stat-kills">0</dd></div>
+        <div><dt>Best combo</dt><dd id="stat-combo">0</dd></div>
+        <div><dt>Weapon</dt><dd id="stat-tier">1</dd></div>
+        <div><dt>Time</dt><dd id="stat-time">0:00</dd></div>
       </dl>
       <div class="actions">
         <button id="btn-restart" class="primary-btn" type="button">Play again</button>
@@ -152,18 +181,29 @@
 <p id="live-region" class="sr-only" aria-live="polite" role="status"></p>
 
 <script src="src/config.js"></script>
-<script src="src/rng.js"></script>
 <script src="src/geometry.js"></script>
-<script src="src/ring.js"></script>
-<script src="src/game.js"></script>
-<script src="src/assets.js"></script>
+<script src="src/rng.js"></script>
 <script src="src/color.js"></script>
+<script src="src/pool.js"></script>
 <script src="src/layout.js"></script>
-<script src="src/effects.js"></script>
+<script src="src/assets.js"></script>
 <script src="src/gl.js"></script>
 <script src="src/renderer-gl.js"></script>
 <script src="src/renderer-2d.js"></script>
+<script src="src/paths.js"></script>
+<script src="src/patterns.js"></script>
+<script src="src/effects.js"></script>
+<script src="src/player.js"></script>
+<script src="src/weapons.js"></script>
+<script src="src/enemies.js"></script>
+<script src="src/boss.js"></script>
+<script src="src/pickups.js"></script>
+<script src="src/director.js"></script>
+<script src="src/game.js"></script>
+<script src="src/scene.js"></script>
+<script src="src/synth.js"></script>
 <script src="src/audio.js"></script>
+<script src="src/quality.js"></script>
 <script src="src/ui.js"></script>
 <script src="src/input.js"></script>
 <script src="src/main.js"></script>

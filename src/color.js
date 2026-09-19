@@ -45,6 +45,6 @@
     return [c[0] / 255, c[1] / 255, c[2] / 255];
   }
 
-  global.CP = global.CP || {};
-  global.CP.color = { parse: parse, mix: mix, css: css, unit: unit };
+  global.GG = global.GG || {};
+  global.GG.color = { parse: parse, mix: mix, css: css, unit: unit };
 })(window);
