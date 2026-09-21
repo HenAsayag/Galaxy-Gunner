@@ -541,6 +541,23 @@ test('a group never exceeds the on-screen enemy budget', () => {
 
 section('full run');
 
+test('opening waves punish standing still across multiple seeds', () => {
+  for (const seed of [7, 42, 20260919]) {
+    const config = freshConfig();
+    GG.mergeConfig(config, JSON.parse(fs.readFileSync(path.join(ROOT, 'config/game-config.json'), 'utf8')));
+    const world = new GG.World(config, {
+      fx: new GG.Effects(config), audio: { play() {} }
+    });
+    world.start(0, { seed });
+    for (let i = 0; i < 30 * 60 && world.state !== 'gameover'; i++) {
+      world.step(1000 / 60);
+      world.fx.update(1000 / 60);
+    }
+    assert.ok(world.player.lives < config.player.startLives,
+      `standing still avoided every hit for 30 seconds, seed ${seed}`);
+  }
+});
+
 function armedWorld() {
   const config = freshConfig();
   const world = new GG.World(config, {
@@ -640,6 +657,10 @@ function runSoak(options) {
       aimX = (t ? t.x : 225) + (options.sloppy ? ((i * 37) % 70) - 35 : 0);
     }
     world.input = { x: aimX, y: 974 * (0.76 + Math.sin(i / 95) * 0.06), offsetY: 0 };
+    /* Pacing runs aim at enemies but do not dodge aimed fire. Keep them
+     * invulnerable so weapon resets do not turn this into a survival test.
+     * Mortal runs and the dedicated damage tests exercise real life loss. */
+    if (!options.mortal) world.player.invulnMs = DT * 2;
     world.step(DT);
     fx.update(DT);
     if (!options.mortal) world.player.lives = 999;   // measure pacing, not survival

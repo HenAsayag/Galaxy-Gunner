@@ -3,21 +3,21 @@
 
   "player": {
     "followTau": 0.115,
-    "hitRadius": 5.5,
+    "hitRadius": 7,
     "fingerOffsetY": 46,
     "startLives": 3,
-    "startBombs": 2,
-    "invulnMs": 1500
+    "startBombs": 1,
+    "invulnMs": 950
   },
 
   "bullets": {
-    "enemySpeed": 300,
-    "enemySpeedFast": 430,
+    "enemySpeed": 345,
+    "enemySpeedFast": 480,
     "telegraphMs": 220
   },
 
   "stage": {
-    "lengthMs": 78000,
+    "lengthMs": 60000,
     "maxQuietMs": 700,
     "difficultyPerStage": 0.22,
     "maxEnemies": 60
@@ -27,9 +27,9 @@
     "bannerMs": 780,
     "magnetRadius": 78,
     "weights": {
-      "weapon": 26, "missile": 14, "shield": 14,
-      "rapid": 12, "multi": 10, "magnet": 8, "bomb": 8,
-      "broadside": 7, "nova": 3
+      "weapon": 26, "missile": 14, "shield": 7,
+      "rapid": 12, "multi": 10, "magnet": 8, "bomb": 4,
+      "broadside": 7, "nova": 2
     }
   },
 

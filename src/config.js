@@ -61,7 +61,7 @@
     /* ---- player --------------------------------------------------------- */
     player: {
       spriteWidth: 44,
-      hitRadius: 5.5,          /* far smaller than the art, per the spec */
+      hitRadius: 7,            /* cockpit-sized, but less forgiving */
       followTau: 0.115,        /* seconds; 0.10-0.16 window from the brief */
       fingerOffsetY: 46,       /* ship sits above the finger */
       maxSpeed: 1500,          /* world units / sec */
@@ -72,9 +72,9 @@
       bottomMargin: 42,
       startLives: 3,
       maxLives: 5,
-      startBombs: 2,
+      startBombs: 1,
       maxBombs: 5,
-      invulnMs: 1500,
+      invulnMs: 950,
       respawnMs: 900,
       damageFlashMs: 85,
       blinkHz: 9
@@ -130,8 +130,8 @@
      * inside combat, and a shooter whose upgrades never arrive is just a
      * shooter. A pity timer in game.js covers the unlucky streaks. */
     enemies: {
-      scout:    { sprite: 'scout_red',    hp: 2,  r: 12, score: 60,  fireMs: 0,    pattern: null,          drop: 0.055 },
-      scoutB:   { sprite: 'scout_blue',   hp: 3,  r: 12, score: 70,  fireMs: 1500, pattern: 'straight',    drop: 0.065 },
+      scout:    { sprite: 'scout_red',    hp: 2,  r: 12, score: 60,  fireMs: 1400, pattern: 'aimed',       drop: 0.055 },
+      scoutB:   { sprite: 'scout_blue',   hp: 3,  r: 12, score: 70,  fireMs: 1200, pattern: 'spread2',     drop: 0.065 },
       twin:     { sprite: 'twin_wing',    hp: 5,  r: 14, score: 110, fireMs: 1250, pattern: 'spread2',     drop: 0.085 },
       dart:     { sprite: 'dart',         hp: 4,  r: 11, score: 95,  fireMs: 1700, pattern: 'aimed',       drop: 0.075, trail: true },
       turret:   { sprite: 'turret_drone', hp: 11, r: 16, score: 200, fireMs: 1450, pattern: 'spread5',     drop: 0.160, hover: true },
@@ -143,8 +143,8 @@
 
     /* ---- projectiles ----------------------------------------------------- */
     bullets: {
-      enemySpeed: 300,
-      enemySpeedFast: 430,
+      enemySpeed: 345,
+      enemySpeedFast: 480,
       telegraphMs: 220,       /* charge glow before a dense attack */
       radius: 4.5,
       maxPlayer: 220,
@@ -168,12 +168,12 @@
        * they notice is that upgrades keep arriving. */
       pityKills: 16,
       /* relative weights used when an enemy drops something */
-      weights: { weapon: 26, missile: 14, shield: 14, rapid: 12, multi: 10, magnet: 8, bomb: 8, broadside: 7, nova: 3 }
+      weights: { weapon: 26, missile: 14, shield: 7, rapid: 12, multi: 10, magnet: 8, bomb: 4, broadside: 7, nova: 2 }
     },
 
     /* ---- stage pacing ---------------------------------------------------- */
     stage: {
-      lengthMs: 78000,        /* one continuous intensity curve */
+      lengthMs: 60000,        /* tighter overlapping waves from stage one */
       maxQuietMs: 700,        /* never leave the player with nothing to shoot */
       bossWarnMs: 2200,
       difficultyPerStage: 0.22,
