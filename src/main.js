@@ -472,7 +472,7 @@
       if (forced) throw new Error('forced by ?renderer=2d');
       return new GG.RendererGL(ui.el.playfield, CONFIG, atlas);
     } catch (err) {
-      console.warn('GALAXY GUNNER: WebGL unavailable, falling back to Canvas 2D.',
+      console.warn('VOIDFLARE: WebGL unavailable, falling back to Canvas 2D.',
                    err && err.message);
       /* A canvas is bound to the first context type it hands out, and the
        * attempt above may already have taken a WebGL one - in which case
@@ -538,7 +538,7 @@
         global.requestAnimationFrame(frame);
       })
       .catch(function (err) {
-        console.error('GALAXY GUNNER failed to start', err);
+        console.error('VOIDFLARE failed to start', err);
         var text = document.getElementById('loading-text');
         if (text) text.textContent = 'Failed to load.';
       });

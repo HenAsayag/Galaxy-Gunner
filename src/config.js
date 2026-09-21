@@ -1,4 +1,4 @@
-/* GALAXY GUNNER — central tuning configuration.
+/* VOIDFLARE — central tuning configuration.
  *
  * One place for every number the gameplay layer reads. config/game-config.json
  * is deep-merged on top when the game is served over http(s); opened from
@@ -14,7 +14,7 @@
 
   var CONFIG = {
     meta: {
-      title: 'GALAXY GUNNER',
+      title: 'VOIDFLARE',
       credit: 'Hen Asayag',
       status: 'Original assets and audio, generated at runtime'
     },

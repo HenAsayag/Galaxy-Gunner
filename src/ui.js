@@ -205,7 +205,7 @@
   var GATE = {
     enter: {
       title: 'Full screen',
-      text: 'Galaxy Gunner is played full screen, so the whole phone is playfield.',
+      text: 'Voidflare is played full screen, so the whole phone is playfield.',
       button: 'Tap to play full screen',
       skip: false,
       note: ''

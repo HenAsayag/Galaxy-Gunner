@@ -98,7 +98,7 @@
   RendererGL.prototype.handleContextLost = function (event) {
     event.preventDefault();
     this.lost = true;
-    console.warn('GALAXY GUNNER: WebGL context lost');
+    console.warn('VOIDFLARE: WebGL context lost');
   };
 
   /* ---- sizing ------------------------------------------------------------ */

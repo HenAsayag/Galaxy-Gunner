@@ -1,5 +1,5 @@
 {
-  "_comment": "Runtime tuning overlay for GALAXY GUNNER. Deep-merged over src/config.js when the game is served over http(s); ignored when opened from file://. Only the keys present here are overridden, so this file can stay small.",
+  "_comment": "Runtime tuning overlay for VOIDFLARE. Deep-merged over src/config.js when the game is served over http(s); ignored when opened from file://. Only the keys present here are overridden, so this file can stay small.",
 
   "player": {
     "followTau": 0.115,

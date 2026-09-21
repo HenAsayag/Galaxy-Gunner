@@ -1,4 +1,4 @@
-# GALAXY GUNNER
+# VOIDFLARE
 
 A portrait arcade shooter for the browser. Auto-fire, curved enemy entries,
 dense readable bullet patterns, weapon upgrades that arrive live in combat, and

@@ -2,7 +2,7 @@
  * streaming buffers, textures and a glyph atlas. No dependencies, WebGL 1
  * only, so it runs anywhere the game does.
  *
- * Carried over from the previous build. The only changes for GALAXY GUNNER are
+ * Carried over from the previous build. The only changes for VOIDFLARE are
  * a wider glyph set and the dynamic/index buffer helpers that the sprite
  * batcher needs. */
 (function (global) {
